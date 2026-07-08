@@ -38,6 +38,10 @@ const piStub = {
   sendMessage: () => {},
 } as any;
 
+// OAuth mock behavior (used by the oauth describe block).
+let oauthRegisterStatus = 201;
+let tokenRequests: URLSearchParams[] = [];
+
 // Mock Glean backend. Each test sets `respond` to control the ND-JSON body.
 let server: Server;
 let baseUrl: string;
@@ -127,6 +131,43 @@ before(async () => {
     let body = "";
     req.on("data", (c) => (body += c));
     req.on("end", () => {
+      const url = req.url ?? "/";
+      // OAuth endpoints
+      if (url.startsWith("/.well-known/oauth-authorization-server")) {
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(
+          JSON.stringify({
+            issuer: `${baseUrl}/oauth`,
+            authorization_endpoint: `${baseUrl}/oauth/authorize`,
+            token_endpoint: `${baseUrl}/oauth/token`,
+            registration_endpoint: `${baseUrl}/oauth/register`,
+          }),
+        );
+        return;
+      }
+      if (url.startsWith("/oauth/register")) {
+        res.writeHead(oauthRegisterStatus, { "Content-Type": "application/json" });
+        res.end(
+          oauthRegisterStatus === 201
+            ? JSON.stringify({ client_id: "test-client-id", scope: "chat" })
+            : JSON.stringify({ error: "access_denied" }),
+        );
+        return;
+      }
+      if (url.startsWith("/oauth/token")) {
+        const params = new URLSearchParams(body);
+        tokenRequests.push(params);
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(
+          JSON.stringify({
+            access_token: `access-${params.get("grant_type")}`,
+            refresh_token: "refresh-1",
+            expires_in: 3600,
+          }),
+        );
+        return;
+      }
+      // Chat endpoint
       lastRequestBody = body ? JSON.parse(body) : undefined;
       respond({ body: lastRequestBody, res });
     });
@@ -146,6 +187,8 @@ after(() => server.close());
 
 beforeEach(() => {
   lastRequestBody = undefined;
+  oauthRegisterStatus = 201;
+  tokenRequests = [];
   respond = ndjsonResponder([gleanMsg("m1", "CONTENT", "ok")]);
 });
 
@@ -493,5 +536,88 @@ describe("error handling", () => {
       },
     );
     assert.equal(error.stopReason, "aborted");
+  });
+});
+
+// ── OAuth ─────────────────────────────────────────────────────────────────────
+
+describe("oauth", () => {
+  it("registers an oauth block on the provider", () => {
+    const oauth = captured.providerConfig.oauth;
+    assert.ok(oauth);
+    assert.equal(typeof oauth.login, "function");
+    assert.equal(typeof oauth.refreshToken, "function");
+    assert.equal(oauth.getApiKey({ access: "a", refresh: "r", expires: 0 }), "a");
+  });
+
+  it("login: DCR + PKCE code exchange yields credentials with clientId", async () => {
+    const oauth = captured.providerConfig.oauth;
+    const creds = await oauth.login({
+      onAuth: ({ url }: { url: string }) => {
+        // Simulate the browser: hit the redirect_uri with code + state.
+        const authUrl = new URL(url);
+        assert.equal(authUrl.searchParams.get("client_id"), "test-client-id");
+        assert.equal(authUrl.searchParams.get("code_challenge_method"), "S256");
+        assert.ok(authUrl.searchParams.get("code_challenge"));
+        const redirect = new URL(authUrl.searchParams.get("redirect_uri")!);
+        redirect.searchParams.set("code", "auth-code-1");
+        redirect.searchParams.set("state", authUrl.searchParams.get("state")!);
+        fetch(redirect).catch(() => {});
+      },
+      onDeviceCode: () => {},
+      onPrompt: async () => "",
+      onSelect: async () => undefined,
+    });
+
+    assert.equal(creds.access, "access-authorization_code");
+    assert.equal(creds.refresh, "refresh-1");
+    assert.equal(creds.clientId, "test-client-id");
+    assert.ok(creds.expires > Date.now());
+
+    // Code exchange must carry PKCE verifier and no client secret.
+    const exchange = tokenRequests.find(
+      (p) => p.get("grant_type") === "authorization_code",
+    )!;
+    assert.ok(exchange.get("code_verifier"));
+    assert.equal(exchange.get("code"), "auth-code-1");
+    assert.equal(exchange.get("client_secret"), null);
+  });
+
+  it("refreshToken: uses stored clientId and preserves refresh fallback", async () => {
+    const oauth = captured.providerConfig.oauth;
+    const creds = await oauth.refreshToken({
+      access: "old",
+      refresh: "refresh-old",
+      expires: 0,
+      clientId: "test-client-id",
+    });
+    assert.equal(creds.access, "access-refresh_token");
+    assert.equal(creds.clientId, "test-client-id");
+    const req = tokenRequests.find((p) => p.get("grant_type") === "refresh_token")!;
+    assert.equal(req.get("refresh_token"), "refresh-old");
+    assert.equal(req.get("client_id"), "test-client-id");
+  });
+
+  it("refreshToken: rejects without clientId", async () => {
+    const oauth = captured.providerConfig.oauth;
+    await assert.rejects(
+      () => oauth.refreshToken({ access: "a", refresh: "r", expires: 0 }),
+      /client_id/,
+    );
+  });
+
+  it("login: fails with guidance when DCR is restricted", async () => {
+    oauthRegisterStatus = 403;
+    const oauth = captured.providerConfig.oauth;
+    await assert.rejects(
+      () =>
+        oauth.login({
+          onAuth: () => {},
+          onDeviceCode: () => {},
+          onPrompt: async () => "",
+          onSelect: async () => undefined,
+        }),
+      /Dynamic Client Registration may be restricted/,
+    );
   });
 });

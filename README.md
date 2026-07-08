@@ -21,13 +21,21 @@ Set the backend URL (shell profile):
 export GLEAN_BACKEND_URL="https://mycompany-be.glean.com"
 ```
 
-Store the API token via pi (persisted as `glean.key` in
-`~/.pi/agent/auth.json`):
+Authenticate in pi:
 
 ```plaintext
 /login
-# select glean, paste your Glean Client API token
+# select "Glean (SSO via OAuth)" for browser-based SSO login (recommended),
+# or select glean and paste a Glean Client API token
 ```
+
+OAuth uses Glean's OAuth 2.1 Authorization Server (Authorization Code + PKCE,
+scopes `chat offline_access`). The extension registers itself as a public
+client via Dynamic Client Registration, opens your browser for SSO, and pi
+stores and auto-refreshes the tokens in `~/.pi/agent/auth.json`. Requires the
+Glean admin to have enabled the OAuth Authorization Server (Admin Console →
+Settings → Third-party access). If DCR is restricted on your tenant, fall back
+to an API key.
 
 Alternatively export `GLEAN_API_TOKEN` (e.g. via 1Password: set it to an `op://`
 reference and launch with `op run -- pi`).
@@ -40,9 +48,10 @@ npm test
 
 Unit tests (`index.test.ts`) run with the built-in Node test runner (Node >=
 23.6 for native type stripping). They cover request building (most-recent-first
-ordering, author mapping, merging, context stripping) and ND-JSON stream parsing
+ordering, author mapping, merging, context stripping), ND-JSON stream parsing
 (fragment reassembly per messageId, thinking/text interleaving, citations,
-errors, abort) against a mock Glean backend.
+errors, abort), and the OAuth flow (DCR, PKCE code exchange, refresh) against a
+mock Glean backend.
 
 ## Environment variables
 
@@ -108,8 +117,12 @@ full conversation history to Glean on every turn.
 
 ## Token source
 
-The token is resolved from `~/.pi/agent/auth.json` (`glean.key`, managed by pi's
-`/login`) or the `GLEAN_API_TOKEN` env var. For the tool and command, env takes
-precedence over `auth.json`. For the model surface, pi's auth storage takes
-precedence and passes the token via `options.apiKey`, with `$GLEAN_API_TOKEN` as
-the declared fallback.
+Credentials are resolved in this order:
+
+1. pi auth storage (`~/.pi/agent/auth.json`, managed by `/login`) — OAuth
+   tokens are refreshed automatically; API keys are used as-is
+2. `GLEAN_API_TOKEN` env var
+
+The model surface receives the resolved token from pi's provider registry via
+`options.apiKey`. The tool and command resolve through pi's model registry when
+available, falling back to env / `auth.json` directly.

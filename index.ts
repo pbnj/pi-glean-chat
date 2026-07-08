@@ -20,11 +20,15 @@
  *                        (or set GLEAN_INSTANCE as fallback)
  *   GLEAN_INSTANCE     — instance name, e.g. "mycompany"
  *
- * Token: store via /login glean (persisted as glean.key in
- * ~/.pi/agent/auth.json), or export GLEAN_API_TOKEN.
+ * Token: /login glean (OAuth via Glean's authorization server + your SSO,
+ * persisted in ~/.pi/agent/auth.json), or paste an API key at /login, or
+ * export GLEAN_API_TOKEN.
  */
 
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type {
+  ExtensionAPI,
+  ExtensionContext,
+} from "@earendil-works/pi-coding-agent";
 import {
   type Api,
   type AssistantMessage,
@@ -32,9 +36,12 @@ import {
   type Context,
   createAssistantMessageEventStream,
   type Model,
+  type OAuthCredentials,
+  type OAuthLoginCallbacks,
   type SimpleStreamOptions,
 } from "@earendil-works/pi-ai";
 import { readFileSync } from "node:fs";
+import { createServer } from "node:http";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { Type } from "typebox";
@@ -47,7 +54,7 @@ import type { ChatMessage } from "@gleanwork/api-client/models/components";
  * Resolve the Glean API token with the following precedence:
  *   1. Explicit argument (passed by the caller)
  *   2. GLEAN_API_TOKEN env var
- *   3. ~/.pi/agent/auth.json  glean.key  (if stored in local pi auth)
+ *   3. ~/.pi/agent/auth.json  glean entry (api_key, or unexpired oauth access)
  */
 function resolveGleanToken(explicit?: string): string {
   if (explicit) return explicit;
@@ -65,18 +72,46 @@ function resolveGleanToken(explicit?: string): string {
       glean.key
     )
       return glean.key;
+    if (
+      glean?.type === "oauth" &&
+      typeof glean?.access === "string" &&
+      glean.access &&
+      (typeof glean?.expires !== "number" || glean.expires > Date.now())
+    )
+      return glean.access;
   } catch {
     // auth.json absent or unreadable — fall through
   }
   return "";
 }
 
-function makeClient(apiToken?: string): Glean {
-  const token = resolveGleanToken(apiToken);
+/**
+ * Resolve the token via pi's auth storage when a context is available.
+ * This path refreshes OAuth tokens automatically; falls back to env/auth.json.
+ */
+async function resolveTokenViaPi(
+  ctx?: Pick<ExtensionContext, "modelRegistry">,
+): Promise<string> {
+  try {
+    const key = await ctx?.modelRegistry?.getApiKeyForProvider?.("glean");
+    if (key) return key;
+  } catch {
+    // provider not registered or resolution failed — fall through
+  }
+  return resolveGleanToken();
+}
+
+// Captured on session_start; lets tool/command surfaces resolve tokens via
+// pi's auth storage (OAuth-aware, auto-refreshing).
+let piContext: Pick<ExtensionContext, "modelRegistry"> | undefined;
+
+function makeClient(): Glean {
   const serverURL = process.env.GLEAN_BACKEND_URL;
   const instance = process.env.GLEAN_INSTANCE;
   return new Glean({
-    apiToken: token,
+    // Async provider: resolved per request, so OAuth refresh via pi's auth
+    // storage is picked up without rebuilding the client.
+    apiToken: () => resolveTokenViaPi(piContext),
     ...(serverURL ? { serverURL } : instance ? { instance } : {}),
   });
 }
@@ -142,6 +177,239 @@ function formatCitations(messages: ChatMessage[]): string {
   }
 
   return lines.length ? "\n\n**Sources:**\n" + lines.join("\n") : "";
+}
+
+// ── OAuth (Glean Authorization Server) ──────────────────────────────────────
+//
+// Authorization Code + PKCE against Glean's OAuth 2.1 server (OAuth 2.1
+// requires PKCE; Glean advertises S256). The client is registered via
+// Dynamic Client Registration (RFC 7591) as a public client
+// (token_endpoint_auth_method: none). Requires the Glean admin to have
+// enabled the OAuth Authorization Server; falls back to API-key login
+// otherwise. Scopes: chat (Chat API) + offline_access (refresh token).
+//
+// The registered client_id is persisted on the credentials object so
+// refreshToken() can reuse it (OAuthCredentials allows extra fields).
+
+const OAUTH_SCOPES = "chat offline_access";
+const OAUTH_CALLBACK_PATH = "/callback";
+
+interface OAuthServerMetadata {
+  authorization_endpoint: string;
+  token_endpoint: string;
+  registration_endpoint?: string;
+}
+
+async function fetchOAuthMetadata(baseUrl: string): Promise<OAuthServerMetadata> {
+  const res = await fetch(`${baseUrl}/.well-known/oauth-authorization-server`);
+  if (!res.ok)
+    throw new Error(
+      `Glean OAuth server metadata unavailable (${res.status}). ` +
+        "Ask your Glean admin to enable the OAuth Authorization Server, " +
+        "or use an API key instead.",
+    );
+  return (await res.json()) as OAuthServerMetadata;
+}
+
+function base64url(bytes: Uint8Array): string {
+  return Buffer.from(bytes)
+    .toString("base64")
+    .replace(/\+/g, "-")
+    .replace(/\//g, "_")
+    .replace(/=+$/, "");
+}
+
+async function generatePKCE(): Promise<{ verifier: string; challenge: string }> {
+  const raw = new Uint8Array(32);
+  crypto.getRandomValues(raw);
+  const verifier = base64url(raw);
+  const digest = await crypto.subtle.digest(
+    "SHA-256",
+    new TextEncoder().encode(verifier),
+  );
+  return { verifier, challenge: base64url(new Uint8Array(digest)) };
+}
+
+/** Register a public client via DCR for the given redirect URI. */
+async function registerOAuthClient(
+  registrationEndpoint: string,
+  redirectUri: string,
+): Promise<string> {
+  const res = await fetch(registrationEndpoint, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      client_name: "pi-glean-chat",
+      redirect_uris: [redirectUri],
+      grant_types: ["authorization_code", "refresh_token"],
+      response_types: ["code"],
+      token_endpoint_auth_method: "none",
+      scope: OAUTH_SCOPES,
+    }),
+  });
+  if (!res.ok) {
+    const body = await res.text().catch(() => "");
+    throw new Error(
+      `Glean OAuth client registration failed (${res.status}): ${body.slice(0, 300)}. ` +
+        "Dynamic Client Registration may be restricted on this tenant — " +
+        "use an API key instead, or ask your admin for a static client.",
+    );
+  }
+  const data = (await res.json()) as { client_id?: string };
+  if (!data.client_id) throw new Error("DCR response missing client_id");
+  return data.client_id;
+}
+
+/** Wait for the OAuth redirect on a loopback server; resolves with the code. */
+function waitForCallback(
+  port: number,
+  expectedState: string,
+): { promise: Promise<string>; close: () => void } {
+  let close = () => {};
+  const promise = new Promise<string>((resolve, reject) => {
+    const timeout = setTimeout(
+      () => {
+        close();
+        reject(new Error("OAuth login timed out after 5 minutes"));
+      },
+      5 * 60 * 1000,
+    );
+    const server = createServer((req, res) => {
+      const url = new URL(req.url ?? "/", `http://127.0.0.1:${port}`);
+      if (url.pathname !== OAUTH_CALLBACK_PATH) {
+        res.writeHead(404).end();
+        return;
+      }
+      const err = url.searchParams.get("error");
+      const code = url.searchParams.get("code");
+      const state = url.searchParams.get("state");
+      if (err || !code || state !== expectedState) {
+        res.writeHead(400, { "Content-Type": "text/html" });
+        res.end("<h3>Login failed. Return to pi for details.</h3>");
+        clearTimeout(timeout);
+        close();
+        reject(
+          new Error(
+            err
+              ? `OAuth error: ${err} ${url.searchParams.get("error_description") ?? ""}`
+              : "OAuth callback missing code or state mismatch",
+          ),
+        );
+        return;
+      }
+      res.writeHead(200, { "Content-Type": "text/html" });
+      res.end("<h3>Signed in to Glean. You can close this tab.</h3>");
+      clearTimeout(timeout);
+      close();
+      resolve(code);
+    });
+    close = () => server.close();
+    server.listen(port, "127.0.0.1");
+    server.on("error", (e) => {
+      clearTimeout(timeout);
+      reject(e);
+    });
+  });
+  return { promise, close };
+}
+
+interface TokenResponse {
+  access_token: string;
+  refresh_token?: string;
+  expires_in?: number;
+}
+
+async function exchangeToken(
+  tokenEndpoint: string,
+  params: Record<string, string>,
+): Promise<TokenResponse> {
+  const res = await fetch(tokenEndpoint, {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams(params).toString(),
+  });
+  if (!res.ok) {
+    const body = await res.text().catch(() => "");
+    throw new Error(`Glean token request failed (${res.status}): ${body.slice(0, 300)}`);
+  }
+  return (await res.json()) as TokenResponse;
+}
+
+function credentialsFromTokens(
+  tokens: TokenResponse,
+  clientId: string,
+  previousRefresh?: string,
+): OAuthCredentials {
+  return {
+    access: tokens.access_token,
+    refresh: tokens.refresh_token ?? previousRefresh ?? "",
+    // Refresh 5 minutes early; default to 55 minutes if expires_in absent.
+    expires: Date.now() + ((tokens.expires_in ?? 3600) - 300) * 1000,
+    clientId,
+  };
+}
+
+async function loginGlean(
+  callbacks: OAuthLoginCallbacks,
+): Promise<OAuthCredentials> {
+  const baseUrl = resolveGleanBaseUrl();
+  if (!baseUrl)
+    throw new Error("Set GLEAN_BACKEND_URL or GLEAN_INSTANCE before /login glean");
+
+  const meta = await fetchOAuthMetadata(baseUrl);
+  if (!meta.registration_endpoint)
+    throw new Error(
+      "Glean OAuth server does not expose Dynamic Client Registration — " +
+        "use an API key instead, or ask your admin for a static client.",
+    );
+
+  // Random loopback port: register, then authorize.
+  const port = 49152 + Math.floor(Math.random() * 16000);
+  const redirectUri = `http://127.0.0.1:${port}${OAUTH_CALLBACK_PATH}`;
+  const clientId = await registerOAuthClient(meta.registration_endpoint, redirectUri);
+
+  const { verifier, challenge } = await generatePKCE();
+  const stateParam = base64url(crypto.getRandomValues(new Uint8Array(16)));
+  const authUrl = new URL(meta.authorization_endpoint);
+  authUrl.search = new URLSearchParams({
+    response_type: "code",
+    client_id: clientId,
+    redirect_uri: redirectUri,
+    scope: OAUTH_SCOPES,
+    state: stateParam,
+    code_challenge: challenge,
+    code_challenge_method: "S256",
+  }).toString();
+
+  const callback = waitForCallback(port, stateParam);
+  callbacks.onAuth({ url: authUrl.toString() });
+  const code = await callback.promise;
+
+  const tokens = await exchangeToken(meta.token_endpoint, {
+    grant_type: "authorization_code",
+    code,
+    redirect_uri: redirectUri,
+    client_id: clientId,
+    code_verifier: verifier,
+  });
+  return credentialsFromTokens(tokens, clientId);
+}
+
+async function refreshGleanToken(
+  credentials: OAuthCredentials,
+): Promise<OAuthCredentials> {
+  const baseUrl = resolveGleanBaseUrl();
+  if (!baseUrl) throw new Error("GLEAN_BACKEND_URL / GLEAN_INSTANCE not set");
+  const clientId = typeof credentials.clientId === "string" ? credentials.clientId : "";
+  if (!credentials.refresh || !clientId)
+    throw new Error("No refresh token or client_id — run /login glean again");
+  const meta = await fetchOAuthMetadata(baseUrl);
+  const tokens = await exchangeToken(meta.token_endpoint, {
+    grant_type: "refresh_token",
+    refresh_token: credentials.refresh,
+    client_id: clientId,
+  });
+  return credentialsFromTokens(tokens, clientId, credentials.refresh);
 }
 
 // ── Model surface (provider) ──────────────────────────────────────────────────
@@ -517,13 +785,21 @@ export default function (pi: ExtensionAPI) {
           maxTokens: 8192,
         },
       ],
+      oauth: {
+        name: "Glean (SSO via OAuth)",
+        login: loginGlean,
+        refreshToken: refreshGleanToken,
+        getApiKey: (credentials) => credentials.access,
+      },
       streamSimple: streamGlean,
     });
   }
 
   // Restore conversation state from session; reset client so token/URL
-  // changes take effect after /reload.
+  // changes take effect after /reload. Capture ctx for OAuth-aware token
+  // resolution in the tool/command surfaces.
   pi.on("session_start", async (_event, ctx) => {
+    piContext = ctx;
     _client = undefined;
     state = { chatId: undefined };
     for (const entry of ctx.sessionManager.getEntries()) {
@@ -567,17 +843,17 @@ export default function (pi: ExtensionAPI) {
       ),
     }),
 
-    async execute(_toolCallId, params, _signal, onUpdate) {
-      const token = resolveGleanToken();
+    async execute(_toolCallId, params, _signal, onUpdate, ctx) {
+      const token = await resolveTokenViaPi(ctx ?? piContext);
       if (!token) {
         return {
           content: [
             {
               type: "text",
               text:
-                "GLEAN_API_TOKEN is not set. " +
-                "Launch pi with `op run -- pi` or export the token, " +
-                "or store a glean.key in ~/.pi/agent/auth.json.",
+                "No Glean credentials. " +
+                "Run /login and select glean (OAuth or API key), " +
+                "or export GLEAN_API_TOKEN.",
             },
           ],
           details: {},
@@ -671,10 +947,10 @@ export default function (pi: ExtensionAPI) {
         return;
       }
 
-      const token = resolveGleanToken();
+      const token = await resolveTokenViaPi(ctx ?? piContext);
       if (!token) {
         ctx.ui.notify(
-          "GLEAN_API_TOKEN is not set (no env var or auth.json key)",
+          "No Glean credentials — run /login and select glean, or export GLEAN_API_TOKEN",
           "error",
         );
         return;
