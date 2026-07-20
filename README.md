@@ -61,6 +61,7 @@ mock Glean backend.
 | `GLEAN_INSTANCE`             | one of   | Instance name, e.g. `mycompany` — used when `GLEAN_BACKEND_URL` is absent |
 | `GLEAN_API_TOKEN`            | no       | Glean Client API token — overrides the token stored in `auth.json`        |
 | `GLEAN_ENABLE_MODEL_SURFACE` | no       | Set to `0` to disable the provider/model surface                          |
+| `GLEAN_REASONING_MODE`       | no       | Default reasoning mode: `fast`, `advanced`, or `auto` (default `auto`)    |
 
 ## Surfaces
 
@@ -84,6 +85,35 @@ session message so subsequent LLM turns can reference it.
 ```
 
 `--new` clears the current `chatId` and starts a fresh conversation thread.
+
+### Command: `/glean-mode [fast|advanced|auto]`
+
+View, set, or toggle the reasoning mode used for every Glean chat request
+(applies to the tool, the `/glean` command, and the model surface). The mode maps
+to Glean's `agentConfig.agent`:
+
+| Mode       | Behavior                                                        |
+| ---------- | -------------------------------------------------------------- |
+| `fast`     | Agentic engine; faster, lower-quality results                  |
+| `advanced` | Agentic engine; thinks longer, more LLM calls, higher quality  |
+| `auto`     | Agentic engine; routes reasoning effort by question/context    |
+
+```plaintext
+/glean-mode              # cycle to the next mode and report it
+/glean-mode advanced     # set a specific mode
+```
+
+With no argument the command cycles `fast -> advanced -> auto -> fast`. The
+selection is persisted in session state and survives `/reload`. The startup
+default comes from `GLEAN_REASONING_MODE` (or `auto` if unset). These agents
+require the agentic engine to be enabled in your Glean deployment.
+
+While the `glean / Glean Assistant` model is selected, the footer is replaced
+with a compact Glean footer whose model line reads
+`(glean) glean-assistant • <mode>`, mirroring the built-in
+`model • thinking-level` indicator. Glean's API exposes no token/context/cost
+data, so those stats are omitted. Switching to any other model restores pi's
+built-in footer.
 
 ### Model: `glean / Glean Assistant`
 

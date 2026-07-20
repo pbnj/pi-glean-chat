@@ -22,9 +22,12 @@ import { after, before, beforeEach, describe, it } from "node:test";
 type Captured = {
   providerName?: string;
   providerConfig?: any;
+  commands: Record<string, any>;
+  entries: any[];
+  handlers: Record<string, any[]>;
 };
 
-const captured: Captured = {};
+const captured: Captured = { commands: {}, entries: [], handlers: {} };
 
 const piStub = {
   registerProvider: (name: string, cfg: any) => {
@@ -32,11 +35,61 @@ const piStub = {
     captured.providerConfig = cfg;
   },
   registerTool: () => {},
-  registerCommand: () => {},
-  on: () => {},
-  appendEntry: () => {},
+  registerCommand: (name: string, cfg: any) => {
+    captured.commands[name] = cfg;
+  },
+  on: (event: string, handler: any) => {
+    (captured.handlers[event] ??= []).push(handler);
+  },
+  appendEntry: (_type: string, data: any) => {
+    captured.entries.push(data);
+  },
   sendMessage: () => {},
 } as any;
+
+/** Fire captured extension event handlers with the given payload + ctx. */
+async function fireEvent(event: string, payload: any, ctx: any) {
+  for (const h of captured.handlers[event] ?? []) await h(payload, ctx);
+}
+
+/** Minimal ExtensionCommandContext double for exercising command handlers. */
+function makeCommandCtx(overrides: Record<string, any> = {}) {
+  const notes: { message: string; level: string }[] = [];
+  const statuses: Record<string, string | undefined> = {};
+  let footerFactory: any = null;
+  const ui = {
+    notify: (message: string, level: string) => notes.push({ message, level }),
+    setStatus: (key: string, text: string | undefined) => {
+      statuses[key] = text;
+    },
+    setFooter: (factory: any) => {
+      footerFactory = factory;
+    },
+  };
+  return {
+    notes,
+    statuses,
+    mode: "tui",
+    cwd: "/tmp/project",
+    model: { id: "glean-assistant", provider: "glean" },
+    ui,
+    getFooter: () => footerFactory,
+    ...overrides,
+  } as any;
+}
+
+/** Fake theme + footerData for rendering a captured footer factory. */
+function renderFooter(factory: any, providerCount = 2, branch: string | null = null) {
+  const theme = { fg: (_c: string, t: string) => t, bold: (t: string) => t };
+  const footerData = {
+    getGitBranch: () => branch,
+    getAvailableProviderCount: () => providerCount,
+    getExtensionStatuses: () => new Map(),
+    onBranchChange: () => () => {},
+  };
+  const component = factory({}, theme, footerData);
+  return component.render(80) as string[];
+}
 
 // OAuth mock behavior (used by the oauth describe block).
 let oauthRegisterStatus = 201;
@@ -301,6 +354,148 @@ describe("request building", () => {
       ],
     });
     assert.ok(!JSON.stringify(lastRequestBody).includes("SECRET THINKING"));
+  });
+});
+
+// ── Reasoning mode ─────────────────────────────────────────────────────
+
+describe("reasoning mode", () => {
+  it("defaults to AUTO in the request agentConfig", async () => {
+    // /glean-mode --> auto is the default; a fresh cycle test below relies on
+    // this ordering, so assert the default before mutating session state.
+    await runStream({ messages: [userMsg("hi")] });
+    assert.deepEqual(lastRequestBody.agentConfig, { agent: "AUTO" });
+  });
+
+  it("registers the /glean-mode command", () => {
+    assert.equal(typeof captured.commands["glean-mode"], "object");
+    assert.equal(typeof captured.commands["glean-mode"].handler, "function");
+  });
+
+  it("sets the mode explicitly and applies it to requests", async () => {
+    const ctx = makeCommandCtx();
+    await captured.commands["glean-mode"].handler("advanced", ctx);
+    assert.ok(ctx.notes.some((n: any) => n.message.includes("ADVANCED")));
+
+    await runStream({ messages: [userMsg("hi")] });
+    assert.deepEqual(lastRequestBody.agentConfig, { agent: "ADVANCED" });
+  });
+
+  it("cycles to the next mode when given no argument", async () => {
+    const ctx = makeCommandCtx();
+    // Start from a known state: advanced -> auto -> fast -> advanced.
+    await captured.commands["glean-mode"].handler("advanced", ctx);
+    await captured.commands["glean-mode"].handler("", ctx);
+    await runStream({ messages: [userMsg("hi")] });
+    assert.deepEqual(lastRequestBody.agentConfig, { agent: "AUTO" });
+
+    await captured.commands["glean-mode"].handler("", ctx);
+    await runStream({ messages: [userMsg("hi")] });
+    assert.deepEqual(lastRequestBody.agentConfig, { agent: "FAST" });
+  });
+
+  it("rejects an invalid mode without changing state", async () => {
+    const ctx = makeCommandCtx();
+    await captured.commands["glean-mode"].handler("fast", ctx);
+    await captured.commands["glean-mode"].handler("turbo", ctx);
+    assert.ok(
+      ctx.notes.some(
+        (n: any) => n.level === "error" && n.message.includes("turbo"),
+      ),
+    );
+    await runStream({ messages: [userMsg("hi")] });
+    assert.deepEqual(lastRequestBody.agentConfig, { agent: "FAST" });
+  });
+
+  it("persists the selected mode via appendEntry", async () => {
+    const ctx = makeCommandCtx();
+    const before = captured.entries.length;
+    await captured.commands["glean-mode"].handler("advanced", ctx);
+    const added = captured.entries.slice(before);
+    assert.ok(added.some((e: any) => e.reasoningMode === "ADVANCED"));
+  });
+
+  it("renders a custom footer with model and reasoning mode when Glean is active", async () => {
+    const ctx = makeCommandCtx();
+    await captured.commands["glean-mode"].handler("advanced", ctx);
+    await fireEvent(
+      "model_select",
+      { model: { id: "glean-assistant", provider: "glean" } },
+      ctx,
+    );
+    const factory = ctx.getFooter();
+    assert.equal(typeof factory, "function");
+    const lines = renderFooter(factory);
+    assert.equal(lines.length, 2);
+    // Model line is right-aligned and includes provider + reasoning mode.
+    assert.ok(lines[1].includes("(glean) glean-assistant \u2022 advanced"));
+    assert.ok(lines[1].startsWith(" "));
+  });
+
+  it("omits the provider prefix when only one provider is available", async () => {
+    const ctx = makeCommandCtx();
+    await captured.commands["glean-mode"].handler("auto", ctx);
+    await fireEvent(
+      "model_select",
+      { model: { id: "glean-assistant", provider: "glean" } },
+      ctx,
+    );
+    const lines = renderFooter(ctx.getFooter(), 1);
+    assert.ok(lines[1].includes("glean-assistant \u2022 auto"));
+    assert.ok(!lines[1].includes("(glean)"));
+  });
+
+  it("reflects a mode change on the next footer render", async () => {
+    const ctx = makeCommandCtx();
+    await fireEvent(
+      "model_select",
+      { model: { id: "glean-assistant", provider: "glean" } },
+      ctx,
+    );
+    await captured.commands["glean-mode"].handler("fast", ctx);
+    assert.ok(renderFooter(ctx.getFooter())[1].includes("\u2022 fast"));
+  });
+
+  it("restores the built-in footer when switching away from Glean", async () => {
+    const ctx = makeCommandCtx();
+    await fireEvent(
+      "model_select",
+      { model: { id: "glean-assistant", provider: "glean" } },
+      ctx,
+    );
+    assert.equal(typeof ctx.getFooter(), "function");
+    await fireEvent(
+      "model_select",
+      { model: { id: "claude", provider: "anthropic" } },
+      ctx,
+    );
+    // setFooter(undefined) restores pi's default footer.
+    assert.equal(ctx.getFooter(), undefined);
+  });
+
+  it("does not install a custom footer while a non-Glean model is active", async () => {
+    const ctx = makeCommandCtx();
+    await fireEvent(
+      "model_select",
+      { model: { id: "claude", provider: "anthropic" } },
+      ctx,
+    );
+    await captured.commands["glean-mode"].handler("advanced", ctx);
+    assert.equal(ctx.getFooter(), null);
+  });
+
+  it("offers argument completions filtered by prefix", async () => {
+    const cmd = captured.commands["glean-mode"];
+    const all = await cmd.getArgumentCompletions("");
+    assert.deepEqual(
+      all.map((i: any) => i.value).sort(),
+      ["advanced", "auto", "fast"],
+    );
+    const a = await cmd.getArgumentCompletions("a");
+    assert.deepEqual(
+      a.map((i: any) => i.value).sort(),
+      ["advanced", "auto"],
+    );
   });
 });
 

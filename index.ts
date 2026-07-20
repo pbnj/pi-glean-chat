@@ -9,6 +9,9 @@
  *   2. /glean command   — interactive query with no LLM round-trip.
  *                         Answer injected as a displayed session message.
  *                         /glean --new <question> resets the thread.
+ *                         /glean-mode [fast|advanced|auto] sets the reasoning
+ *                         mode used by all surfaces (default via
+ *                         GLEAN_REASONING_MODE, else auto).
  *
  *   3. glean model      — "glean / Glean Assistant" selectable via /model.
  *                         Streams via ND-JSON (stream: true). No tool calling,
@@ -28,6 +31,7 @@
 import type {
   ExtensionAPI,
   ExtensionContext,
+  ExtensionUIContext,
 } from "@earendil-works/pi-coding-agent";
 import {
   type Api,
@@ -128,11 +132,150 @@ function getClient(): Glean {
 
 interface GleanState {
   chatId?: string; // tool + /glean command thread
+  reasoningMode?: ReasoningMode; // agentic engine reasoning effort
 }
 
 let state: GleanState = {};
 
 const STATE_ENTRY_TYPE = "glean-chat-state" as const;
+
+// ── Reasoning mode ────────────────────────────────────────────────────────────
+//
+// Selects the Glean agent that executes a chat request (agentConfig.agent).
+// Only the agentic-engine agents are exposed here; they require the agentic
+// engine to be enabled in the Glean deployment.
+//   FAST     — faster, lower-quality results.
+//   ADVANCED — thinks longer, more LLM calls, higher-quality results.
+//   AUTO     — routes between reasoning efforts based on the question/context.
+
+type ReasoningMode = "FAST" | "ADVANCED" | "AUTO";
+
+const REASONING_MODES: readonly ReasoningMode[] = ["FAST", "ADVANCED", "AUTO"];
+
+/** Parse a user-supplied string into a ReasoningMode (case-insensitive). */
+function normalizeReasoningMode(input: string): ReasoningMode | undefined {
+  const v = input.trim().toUpperCase();
+  return (REASONING_MODES as readonly string[]).includes(v)
+    ? (v as ReasoningMode)
+    : undefined;
+}
+
+/** Default mode from GLEAN_REASONING_MODE env var, else AUTO. */
+function defaultReasoningMode(): ReasoningMode {
+  return (
+    normalizeReasoningMode(process.env.GLEAN_REASONING_MODE ?? "") ?? "AUTO"
+  );
+}
+
+/** Active mode: session override (via /glean-mode) or the env/default. */
+function currentReasoningMode(): ReasoningMode {
+  return state.reasoningMode ?? defaultReasoningMode();
+}
+
+/** agentConfig payload applied to every Glean chat request. */
+function reasoningAgentConfig(): { agent: ReasoningMode } {
+  return { agent: currentReasoningMode() };
+}
+
+// State captured from session/model events so the custom footer can render the
+// active Glean model and reasoning mode. When the Glean model is selected we
+// replace pi's footer entirely (Glean exposes no token/context/cost data, so
+// there is nothing to reimplement); switching to any other model restores the
+// built-in footer.
+let activeIsGlean = false;
+let gleanFooterActive = false;
+let footerModel: { id: string; provider: string } = {
+  id: "glean-assistant",
+  provider: "glean",
+};
+let footerCwd = process.cwd();
+
+// Minimal structural type for a TUI footer component (pi's Component type is
+// not re-exported from the package root).
+type FooterComponent = { render(width: number): string[]; dispose?(): void };
+
+/** True when a model belongs to the Glean provider. */
+function isGleanModel(model: { provider?: string } | undefined): boolean {
+  return model?.provider === "glean";
+}
+
+/** Visible width of a string, ignoring ANSI SGR escape codes. */
+function visibleWidth(s: string): number {
+  // eslint-disable-next-line no-control-regex
+  return s.replace(/\u001b\[[0-9;]*m/g, "").length;
+}
+
+/** Truncate a plain (uncolored) string to width, adding an ellipsis if needed. */
+function truncatePlain(s: string, width: number): string {
+  if (width <= 0) return "";
+  return s.length > width ? s.slice(0, Math.max(0, width - 1)) + "\u2026" : s;
+}
+
+/** Replace the home-directory prefix with ~ for compact display. */
+function formatCwd(cwd: string): string {
+  const home = process.env.HOME || process.env.USERPROFILE || "";
+  if (!home) return cwd;
+  if (cwd === home) return "~";
+  if (cwd.startsWith(home + "/")) return "~" + cwd.slice(home.length);
+  return cwd;
+}
+
+/**
+ * Build a custom footer for the Glean model: a dim pwd line plus a right-aligned
+ * `(provider) model • <reasoning>` line, mirroring pi's built-in footer layout
+ * minus the token/context stats Glean does not provide. Reads the reasoning mode
+ * live, so /glean-mode changes are reflected on the next render.
+ */
+function makeGleanFooter(
+  theme: { fg(color: string, text: string): string },
+  footerData: {
+    getGitBranch(): string | null;
+    getAvailableProviderCount(): number;
+  },
+): FooterComponent {
+  return {
+    render(width: number): string[] {
+      let pwd = formatCwd(footerCwd);
+      const branch = footerData.getGitBranch?.();
+      if (branch) pwd = `${pwd} (${branch})`;
+      const pwdLine = theme.fg("dim", truncatePlain(pwd, width));
+
+      const showProvider = (footerData.getAvailableProviderCount?.() ?? 1) > 1;
+      const modelSeg = showProvider
+        ? `(${footerModel.provider}) ${footerModel.id}`
+        : footerModel.id;
+      const right = truncatePlain(
+        `${modelSeg} • ${currentReasoningMode().toLowerCase()}`,
+        width,
+      );
+      const pad = " ".repeat(Math.max(0, width - visibleWidth(right)));
+      const modelLine = theme.fg("dim", pad + right);
+
+      return [pwdLine, modelLine];
+    },
+  };
+}
+
+/**
+ * Install the custom footer when the Glean model is active, or restore pi's
+ * built-in footer when switching away. Only acts in TUI mode; no-ops elsewhere.
+ */
+function applyGleanFooter(
+  ui: ExtensionUIContext | undefined,
+  mode: string | undefined,
+): void {
+  if (!ui?.setFooter) return;
+  if (mode && mode !== "tui") return;
+  if (activeIsGlean) {
+    ui.setFooter((_tui, theme, footerData) =>
+      makeGleanFooter(theme as any, footerData as any),
+    );
+    gleanFooterActive = true;
+  } else if (gleanFooterActive) {
+    ui.setFooter(undefined); // restore built-in footer
+    gleanFooterActive = false;
+  }
+}
 
 // ── Response helpers ──────────────────────────────────────────────────────────
 
@@ -691,6 +834,7 @@ function streamGlean(
         },
         body: JSON.stringify({
           messages: buildGleanMessages(context),
+          agentConfig: reasoningAgentConfig(),
           stream: true,
         }),
         signal: options?.signal ?? null,
@@ -800,6 +944,9 @@ export default function (pi: ExtensionAPI) {
   // resolution in the tool/command surfaces.
   pi.on("session_start", async (_event, ctx) => {
     piContext = ctx;
+    footerCwd = ctx.cwd ?? process.cwd();
+    activeIsGlean = isGleanModel(ctx.model);
+    if (ctx.model) footerModel = { id: ctx.model.id, provider: ctx.model.provider };
     _client = undefined;
     state = { chatId: undefined };
     for (const entry of ctx.sessionManager.getEntries()) {
@@ -810,6 +957,17 @@ export default function (pi: ExtensionAPI) {
         Object.assign(state, (entry as any).data ?? {});
       }
     }
+    applyGleanFooter(ctx.ui, ctx.mode);
+  });
+
+  // Replace the footer with the Glean model + reasoning mode while the Glean
+  // model is selected; restore pi's built-in footer on switching away.
+  pi.on("model_select", async (event, ctx) => {
+    footerCwd = ctx.cwd ?? footerCwd;
+    activeIsGlean = isGleanModel(event.model);
+    if (event.model)
+      footerModel = { id: event.model.id, provider: event.model.provider };
+    applyGleanFooter(ctx.ui, ctx.mode);
   });
 
   // ── Tool: glean_chat ────────────────────────────────────────────────────────
@@ -874,6 +1032,7 @@ export default function (pi: ExtensionAPI) {
             messages: [
               { author: "USER", fragments: [{ text: params.message }] },
             ],
+            agentConfig: reasoningAgentConfig(),
             ...(state.chatId ? { chatId: state.chatId } : {}),
           },
           undefined, // locale
@@ -963,6 +1122,7 @@ export default function (pi: ExtensionAPI) {
         const response = await getClient().client.chat.create(
           {
             messages: [{ author: "USER", fragments: [{ text: message }] }],
+            agentConfig: reasoningAgentConfig(),
             ...(state.chatId ? { chatId: state.chatId } : {}),
           },
           undefined, // locale
@@ -997,6 +1157,57 @@ export default function (pi: ExtensionAPI) {
       } finally {
         ctx.ui.setStatus("glean", "");
       }
+    },
+  });
+
+  // ── Command: /glean-mode ───────────────────────────────────────────────────
+
+  pi.registerCommand("glean-mode", {
+    description:
+      "View, set, or toggle the Glean reasoning mode. " +
+      "Usage: /glean-mode [fast|advanced|auto]  (no arg cycles to the next mode)",
+    getArgumentCompletions: (prefix) => {
+      const p = prefix.trim().toLowerCase();
+      return REASONING_MODES.filter((m) =>
+        m.toLowerCase().startsWith(p),
+      ).map((m) => ({
+        value: m.toLowerCase(),
+        label: m.toLowerCase(),
+        description:
+          m === "FAST"
+            ? "Faster, lower-quality results"
+            : m === "ADVANCED"
+              ? "Thinks longer, higher-quality results"
+              : "Routes reasoning effort automatically",
+      }));
+    },
+    handler: async (args, ctx) => {
+      const arg = args?.trim() ?? "";
+
+      let mode: ReasoningMode;
+      if (!arg) {
+        // No argument: cycle to the next mode.
+        const idx = REASONING_MODES.indexOf(currentReasoningMode());
+        mode = REASONING_MODES[(idx + 1) % REASONING_MODES.length];
+      } else {
+        const parsed = normalizeReasoningMode(arg);
+        if (!parsed) {
+          ctx.ui.notify(
+            `Invalid mode "${arg}". Use one of: ${REASONING_MODES.map((m) =>
+              m.toLowerCase(),
+            ).join(", ")}.`,
+            "error",
+          );
+          return;
+        }
+        mode = parsed;
+      }
+
+      state.reasoningMode = mode;
+      pi.appendEntry(STATE_ENTRY_TYPE, { reasoningMode: mode });
+      // Re-render the custom footer so the new mode shows immediately.
+      applyGleanFooter(ctx.ui, ctx.mode);
+      ctx.ui.notify(`Glean reasoning mode: ${mode}`, "info");
     },
   });
 }
