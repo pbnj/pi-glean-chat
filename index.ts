@@ -976,18 +976,34 @@ export default function (pi: ExtensionAPI) {
     name: "glean_chat",
     label: "Glean Chat",
     description:
-      "Query Glean AI for internal company knowledge: documentation, runbooks, " +
-      "policies, ADRs, Jira tickets, Confluence pages, Slack discussions, and " +
-      "anything else indexed in Glean. Conversations are threaded — follow-up " +
-      "calls continue the same chat session unless new_conversation is true.",
+      "Query Glean AI for both INTERNAL and EXTERNAL knowledge. Glean AI can " +
+      "search private/internal resources (Confluence, Jira, Linear, Slack, " +
+      "private GitHub repos, runbooks, policies, ADRs, and anything else " +
+      "indexed in Glean) AND public resources on the internet (docs, web " +
+      "pages, public GitHub repos). Prefer asking Glean a specific question " +
+      "about a page rather than requesting a raw dump — e.g. ask 'review " +
+      "https://registry.terraform.io/providers/Scalr/scalr/latest/docs/resources/environment_hook " +
+      "and tell me how to import that resource' instead of 'print the last " +
+      "100 lines of <url>'. If you truly need exact content, ask explicitly, " +
+      "e.g. 'print the raw contents of <url>' or 'print the first 100 lines " +
+      "of <url>'. Conversations are threaded — follow-up calls continue the " +
+      "same chat session unless new_conversation is true.",
     promptSnippet:
-      "Query Glean AI for internal company knowledge and documentation",
+      "Query Glean AI for internal AND external knowledge (private company " +
+      "resources and public internet)",
     promptGuidelines: [
-      "Use glean_chat for questions about internal company docs, runbooks, " +
-        "policies, ADRs, Jira tickets, Confluence pages, or internal processes.",
+      "Use glean_chat for internal company knowledge (docs, runbooks, " +
+        "policies, ADRs, Jira/Linear tickets, Confluence pages, Slack, private " +
+        "GitHub repos) as well as external/public knowledge on the internet " +
+        "(public docs, web pages, public GitHub repos).",
       "Use glean_chat when the user asks what the wiki or internal docs say " +
         "about a topic, or when you need company-specific context not available " +
         "in your training data.",
+      "Prefer asking Glean a specific question about a page rather than " +
+        "requesting a raw dump — e.g. 'review <url> and tell me how to import " +
+        "that resource' instead of 'print the last 100 lines of <url>'. When " +
+        "you genuinely need exact content, ask explicitly, e.g. 'print the raw " +
+        "contents of <url>' or 'print the first 100 lines of <url>'.",
     ],
     parameters: Type.Object({
       message: Type.String({

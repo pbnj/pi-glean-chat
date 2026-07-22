@@ -25,7 +25,7 @@ Authenticate in pi:
 
 ```plaintext
 /login
-# select "Glean (SSO via OAuth)" for browser-based SSO login (recommended),
+# select "Subscription", then "Glean (SSO via OAuth)" for browser-based SSO login (recommended),
 # or select glean and paste a Glean Client API token
 ```
 
@@ -37,8 +37,8 @@ Glean admin to have enabled the OAuth Authorization Server (Admin Console →
 Settings → Third-party access). If DCR is restricted on your tenant, fall back
 to an API key.
 
-Alternatively export `GLEAN_API_TOKEN` (e.g. via 1Password: set it to an `op://`
-reference and launch with `op run -- pi`).
+Alternatively, export `GLEAN_API_TOKEN` or run `/login` then select API Key and
+enter the API key.
 
 ## Tests
 
