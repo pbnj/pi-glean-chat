@@ -5,6 +5,27 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.3.0] - 2026-07-22
+
+### Added
+
+- `glean_chat` now accepts an optional `reasoning` argument (`FAST`, `ADVANCED`,
+  or `AUTO`) so the model can pick the reasoning effort per call — e.g.
+  `reasoning: ADVANCED` for deep-research questions or `reasoning: FAST` for
+  quick answers. When omitted, the session/env reasoning mode (set via
+  `/glean-mode` or `GLEAN_REASONING_MODE`) is used.
+
+### Fixed
+
+- `glean_chat` no longer returns an empty answer with only a **Sources** block.
+  The tool extracted the answer from the *last* non-USER message, but Glean
+  returns many non-`CONTENT` messages (UPDATE/HEADING/CONTROL_*/SERVER_TOOL/
+  WARNING/etc.). When the final message was not `CONTENT`, the answer came back
+  empty while citations were still appended. This happened more often in
+  `ADVANCED`/agentic runs, which emit more intermediate messages. The answer is
+  now assembled from every `CONTENT` message (matching the streaming path), with
+  a fallback to the last non-USER message.
+
 ## [1.2.0] - 2026-07-22
 
 ### Changed

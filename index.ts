@@ -172,9 +172,12 @@ function currentReasoningMode(): ReasoningMode {
   return state.reasoningMode ?? defaultReasoningMode();
 }
 
-/** agentConfig payload applied to every Glean chat request. */
-function reasoningAgentConfig(): { agent: ReasoningMode } {
-  return { agent: currentReasoningMode() };
+/**
+ * agentConfig payload applied to a Glean chat request. An explicit `override`
+ * (e.g. a per-call `reasoning` tool argument) wins over the session/env mode.
+ */
+function reasoningAgentConfig(override?: ReasoningMode): { agent: ReasoningMode } {
+  return { agent: override ?? currentReasoningMode() };
 }
 
 // State captured from session/model events so the custom footer can render the
@@ -280,14 +283,32 @@ function applyGleanFooter(
 // ── Response helpers ──────────────────────────────────────────────────────────
 
 /**
- * Extract the last GLEAN_AI turn's text from a Glean messages array.
- * Joins all text fragments in the last non-USER message.
+ * Extract the GLEAN_AI answer text from a Glean messages array.
+ *
+ * Glean returns many non-USER messages with different messageTypes
+ * (UPDATE, HEADING, CONTEXT, CONTROL_*, SERVER_TOOL, WARNING, DEBUG, CONTENT).
+ * The actual answer lives in CONTENT messages, and may be split across several
+ * of them. Reading only the last non-USER message breaks whenever the final
+ * message is a non-CONTENT (status/control/citation) message — yielding an
+ * empty answer with only a Sources block. This mirrors the streaming path by
+ * concatenating every CONTENT message's text.
  */
 function extractAiText(messages: ChatMessage[]): string {
-  const aiMsgs = messages.filter((m) => m.author !== "USER");
-  if (!aiMsgs.length) return "";
-  const last = aiMsgs[aiMsgs.length - 1];
-  return (last.fragments ?? []).map((f) => f.text ?? "").join("");
+  const parts: string[] = [];
+  for (const msg of messages) {
+    if (msg.author === "USER") continue;
+    if ((msg.messageType ?? "CONTENT") !== "CONTENT") continue;
+    const text = (msg.fragments ?? []).map((f) => f.text ?? "").join("");
+    if (text) parts.push(text);
+  }
+  // Fallback: if no CONTENT messages carried text (unusual message shapes),
+  // fall back to the last non-USER message so we never silently drop an answer.
+  if (!parts.length) {
+    const aiMsgs = messages.filter((m) => m.author !== "USER");
+    const last = aiMsgs[aiMsgs.length - 1];
+    return last ? (last.fragments ?? []).map((f) => f.text ?? "").join("") : "";
+  }
+  return parts.join("\n\n");
 }
 
 /**
@@ -987,7 +1008,9 @@ export default function (pi: ExtensionAPI) {
       "100 lines of <url>'. If you truly need exact content, ask explicitly, " +
       "e.g. 'print the raw contents of <url>' or 'print the first 100 lines " +
       "of <url>'. Conversations are threaded — follow-up calls continue the " +
-      "same chat session unless new_conversation is true.",
+      "same chat session unless new_conversation is true. Pass reasoning: " +
+      "ADVANCED for deep-research questions or reasoning: FAST for quick " +
+      "answers.",
     promptSnippet:
       "Query Glean AI for internal AND external knowledge (private company " +
       "resources and public internet)",
@@ -1004,6 +1027,9 @@ export default function (pi: ExtensionAPI) {
         "that resource' instead of 'print the last 100 lines of <url>'. When " +
         "you genuinely need exact content, ask explicitly, e.g. 'print the raw " +
         "contents of <url>' or 'print the first 100 lines of <url>'.",
+      "Set reasoning: ADVANCED for deep-research or multi-step questions that " +
+        "benefit from longer thinking, and reasoning: FAST for simple lookups " +
+        "where a quick answer is enough; omit it to use the session default.",
     ],
     parameters: Type.Object({
       message: Type.String({
@@ -1014,6 +1040,18 @@ export default function (pi: ExtensionAPI) {
           description:
             "Start a fresh conversation thread (clears chatId). Default false.",
         }),
+      ),
+      reasoning: Type.Optional(
+        Type.Union(
+          REASONING_MODES.map((m) => Type.Literal(m)),
+          {
+            description:
+              "Reasoning effort for this query. ADVANCED thinks longer with " +
+              "more LLM calls for deep-research questions; FAST returns quick, " +
+              "lower-effort answers; AUTO lets Glean route automatically. " +
+              "Defaults to the session/env reasoning mode.",
+          },
+        ),
       ),
     }),
 
@@ -1048,7 +1086,7 @@ export default function (pi: ExtensionAPI) {
             messages: [
               { author: "USER", fragments: [{ text: params.message }] },
             ],
-            agentConfig: reasoningAgentConfig(),
+            agentConfig: reasoningAgentConfig(params.reasoning),
             ...(state.chatId ? { chatId: state.chatId } : {}),
           },
           undefined, // locale

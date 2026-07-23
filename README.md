@@ -71,6 +71,10 @@ The LLM can call `glean_chat` to answer questions about internal knowledge.
 Conversations are threaded — follow-up calls continue the same Glean chat
 session via `chatId`. Pass `new_conversation: true` to start a fresh thread.
 
+Pass `reasoning: "ADVANCED"` for deep-research questions or `reasoning: "FAST"`
+for quick answers; omit it to use the session/env reasoning mode. This is a
+per-call override of the mode set by `/glean-mode` or `GLEAN_REASONING_MODE`.
+
 The tool's `promptGuidelines` instruct the model to use it for internal docs,
 runbooks, policies, ADRs, Jira tickets, and Confluence pages.
 
