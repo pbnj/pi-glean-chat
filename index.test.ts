@@ -765,6 +765,180 @@ describe("error handling", () => {
   });
 });
 
+// ── Tool streaming ────────────────────────────────────────────────────────────
+
+describe("tool streaming", () => {
+  /** Run the registered glean_chat tool, capturing partial updates. */
+  async function runTool(params: any, signal?: AbortSignal) {
+    const updates: string[] = [];
+    const result = await captured.tool.execute(
+      "call-1",
+      params,
+      signal,
+      (partial: any) => {
+        updates.push(partial.content.map((c: any) => c.text).join(""));
+      },
+      undefined,
+    );
+    return { updates, result, text: result.content.map((c: any) => c.text).join("") };
+  }
+
+  /** Responder writing ND-JSON lines with a delay before each. */
+  function delayedResponder(lines: unknown[], delayMs = 120) {
+    return ({ res }: { body: any; res: import("node:http").ServerResponse }) => {
+      res.writeHead(200, { "Content-Type": "text/plain" });
+      let i = 0;
+      const tick = () => {
+        if (i >= lines.length) {
+          res.end();
+          return;
+        }
+        res.write(JSON.stringify(lines[i++]) + "\n");
+        setTimeout(tick, delayMs);
+      };
+      // Delay the first line too, so it clears the partial-update throttle.
+      setTimeout(tick, delayMs);
+    };
+  }
+
+  it("pushes partial results as content arrives", async () => {
+    respond = delayedResponder([
+      gleanMsg("c1", "CONTENT", "Hello"),
+      gleanMsg("c1", "CONTENT", " world"),
+    ]);
+    const { updates, text } = await runTool({
+      message: "q",
+      new_conversation: true,
+    });
+    assert.equal(text, "Hello world");
+    // Initial placeholder, then a growing answer.
+    assert.match(updates[0], /Querying Glean/);
+    assert.ok(updates.includes("Hello"), `updates: ${JSON.stringify(updates)}`);
+    assert.ok(updates.includes("Hello world"));
+  });
+
+  it("shows the latest status line until the answer starts", async () => {
+    respond = delayedResponder([
+      gleanMsg("u1", "UPDATE", "Searching Confluence"),
+      gleanMsg("c1", "CONTENT", "Answer"),
+    ]);
+    const { updates, text } = await runTool({
+      message: "q",
+      new_conversation: true,
+    });
+    assert.ok(updates.includes("Searching Confluence"));
+    assert.equal(text, "Answer");
+  });
+
+  it("streams via the chat endpoint and threads chatId across calls", async () => {
+    respond = ({ res }) => {
+      res.writeHead(200, { "Content-Type": "text/plain" });
+      res.write(
+        JSON.stringify({ chatId: "chat-42", ...gleanMsg("c1", "CONTENT", "a") }) +
+          "\n",
+      );
+      res.end();
+    };
+    await runTool({ message: "first", new_conversation: true });
+    assert.equal(lastRequestBody.stream, true);
+    assert.equal(lastRequestBody.chatId, undefined);
+    assert.equal(lastRequestBody.messages[0].fragments[0].text, "first");
+    assert.ok(captured.entries.some((e) => e.chatId === "chat-42"));
+
+    await runTool({ message: "second" });
+    assert.equal(lastRequestBody.chatId, "chat-42");
+  });
+
+  it("honors the per-call reasoning override", async () => {
+    respond = ndjsonResponder([gleanMsg("c1", "CONTENT", "a")]);
+    await runTool({ message: "q", reasoning: "ADVANCED", new_conversation: true });
+    assert.deepEqual(lastRequestBody.agentConfig, { agent: "ADVANCED" });
+  });
+
+  it("appends a deduplicated Sources block", async () => {
+    respond = ndjsonResponder([
+      gleanMsg("c1", "CONTENT", "answer", {
+        fragments: [
+          { text: "answer" },
+          {
+            citation: {
+              sourceDocument: { title: "Handbook", url: "https://w/hb" },
+            },
+          },
+        ],
+      }),
+      gleanMsg("c2", "CONTENT", undefined, {
+        citations: [
+          {
+            sourceDocument: { title: "Handbook", url: "https://w/hb" },
+          },
+        ],
+      }),
+    ]);
+    const { text } = await runTool({ message: "q", new_conversation: true });
+    assert.match(text, /\*\*Sources:\*\*/);
+    assert.equal(text.match(/https:\/\/w\/hb/g)?.length, 1);
+  });
+
+  it("returns an error result on HTTP failure", async () => {
+    respond = ({ res }) => {
+      res.writeHead(429, { "Content-Type": "text/plain" });
+      res.end("slow down");
+    };
+    const { result, text } = await runTool({
+      message: "q",
+      new_conversation: true,
+    });
+    assert.equal(result.isError, true);
+    assert.match(text, /429/);
+    assert.match(text, /rate limited/i);
+  });
+
+  it("keeps the partial answer when aborted", async () => {
+    const controller = new AbortController();
+    respond = ({ res }) => {
+      res.writeHead(200, { "Content-Type": "text/plain" });
+      res.write(JSON.stringify(gleanMsg("c1", "CONTENT", "partial")) + "\n");
+      setTimeout(() => controller.abort(), 50);
+      setTimeout(() => res.end(), 5000).unref();
+    };
+    const { result, text } = await runTool(
+      { message: "q", new_conversation: true },
+      controller.signal,
+    );
+    assert.equal(result.isError, true);
+    assert.match(text, /aborted/i);
+    assert.match(text, /partial/);
+  });
+
+  it("renders a compact tail while partial and the full text when settled", () => {
+    const theme = { fg: (_c: string, t: string) => t };
+    const lines = Array.from({ length: 20 }, (_, i) => `line ${i}`).join("\n");
+    const result = { content: [{ type: "text", text: lines }], details: {} };
+    const ctx: any = { lastComponent: undefined, isError: false };
+
+    const partial = captured.tool.renderResult(
+      result,
+      { expanded: false, isPartial: true },
+      theme,
+      ctx,
+    );
+    const partialText = partial.render(80).join("\n");
+    assert.ok(!partialText.includes("line 0"), partialText);
+    assert.ok(partialText.includes("line 19"));
+
+    const settled = captured.tool.renderResult(
+      result,
+      { expanded: false, isPartial: false },
+      theme,
+      { ...ctx, lastComponent: partial },
+    );
+    const settledText = settled.render(80).join("\n");
+    assert.ok(settledText.includes("line 0"));
+    assert.ok(settledText.includes("line 19"));
+  });
+});
+
 // ── OAuth ─────────────────────────────────────────────────────────────────────
 
 describe("oauth", () => {

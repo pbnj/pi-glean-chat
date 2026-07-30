@@ -5,6 +5,32 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.4.0] - 2026-07-30
+
+### Added
+
+- `glean_chat` now **streams its answer into the TUI**. Previously the tool made
+  a blocking, non-streaming API call and printed a static `Querying Glean...`
+  line until the whole response arrived. It now uses the same ND-JSON streaming
+  endpoint as the model surface and pushes partial tool results via `onUpdate`:
+  Glean's `UPDATE`/`HEADING` progress lines show while it searches, then the
+  answer text fills in as it is generated (throttled to ~80 ms per frame).
+- A custom `renderResult` for `glean_chat`: while streaming, the tool row shows
+  a dimmed tail of the last 8 lines so the transcript stays compact; the full
+  answer renders once the call settles (or when the row is expanded).
+- `glean_chat` honors the tool-call `AbortSignal`. Cancelling a turn now tears
+  down the HTTP request instead of leaking it, and returns the partial answer
+  received so far.
+
+### Changed
+
+- The ND-JSON reader is now a single shared core (`streamGleanChat`) consumed by
+  both the model surface and the tool, replacing the duplicated parse loop and
+  the tool's dependence on the Glean SDK's blocking `chat.create`. Citation
+  collection and the trailing **Sources** block are shared as well, so both
+  surfaces format answers identically.
+- `@earendil-works/pi-tui` is now a peer dependency (used by `renderResult`).
+
 ## [1.3.1] - 2026-07-30
 
 ### Fixed

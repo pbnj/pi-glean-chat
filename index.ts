@@ -5,6 +5,7 @@
  *
  *   1. glean_chat tool  — LLM-callable; consults Glean mid-task.
  *                         Threads conversations via chatId across tool calls.
+ *                         Streams the answer into the TUI via onUpdate.
  *
  *   2. /glean command   — interactive query with no LLM round-trip.
  *                         Answer injected as a displayed session message.
@@ -49,6 +50,7 @@ import { createServer } from "node:http";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { Type } from "typebox";
+import { Text } from "@earendil-works/pi-tui";
 import { Glean } from "@gleanwork/api-client";
 import type { ChatMessage } from "@gleanwork/api-client/models/components";
 
@@ -138,6 +140,11 @@ interface GleanState {
 let state: GleanState = {};
 
 const STATE_ENTRY_TYPE = "glean-chat-state" as const;
+
+// Streaming tool-result tuning: how often partial results are pushed to the
+// TUI, and how many trailing lines the collapsed partial view shows.
+const TOOL_UPDATE_INTERVAL_MS = 80;
+const TOOL_PARTIAL_TAIL_LINES = 8;
 
 // ── Reasoning mode ────────────────────────────────────────────────────────────
 //
@@ -613,7 +620,15 @@ interface RawGleanMessage {
   citations?: { sourceDocument?: RawSourceDocument }[];
 }
 interface RawGleanChatResponse {
+  chatId?: string;
   messages?: RawGleanMessage[];
+}
+
+/** A Glean chat message payload as sent on the wire. */
+interface GleanRequestMessage {
+  author: "USER" | "GLEAN_AI";
+  messageType: "CONTENT";
+  fragments: { text: string }[];
 }
 
 /**
@@ -623,16 +638,8 @@ interface RawGleanChatResponse {
  * Returned array is ordered MOST RECENT FIRST — the Glean Chat API contract
  * is "a list of chat messages, from most recent to least recent".
  */
-function buildGleanMessages(context: Context): {
-  author: "USER" | "GLEAN_AI";
-  messageType: "CONTENT";
-  fragments: { text: string }[];
-}[] {
-  const out: {
-    author: "USER" | "GLEAN_AI";
-    messageType: "CONTENT";
-    fragments: { text: string }[];
-  }[] = [];
+function buildGleanMessages(context: Context): GleanRequestMessage[] {
+  const out: GleanRequestMessage[] = [];
 
   function push(author: "USER" | "GLEAN_AI", text: string) {
     if (!text.trim()) return;
@@ -672,6 +679,137 @@ function buildGleanMessages(context: Context): {
   return out.reverse();
 }
 
+// ── Shared streaming core ─────────────────────────────────────────────────────
+//
+// One ND-JSON reader for every surface. `streamGleanChat` performs the request
+// and yields normalized events; each consumer decides how to present them:
+//   - the model surface (`streamGlean`) maps them onto pi assistant-message
+//     events (thinking / text deltas),
+//   - the `glean_chat` tool maps them onto `onUpdate` partial tool results so
+//     the answer renders in the TUI as it arrives.
+
+type GleanStreamEvent =
+  | { type: "chat_id"; chatId: string }
+  | { type: "thinking"; text: string; messageId?: string }
+  | { type: "content"; text: string; messageId?: string }
+  | { type: "citation"; url: string; title: string };
+
+interface GleanStreamRequest {
+  token: string;
+  baseUrl: string;
+  messages: GleanRequestMessage[];
+  agentConfig: { agent: ReasoningMode };
+  /** Continue an existing Glean conversation thread. */
+  chatId?: string;
+  signal?: AbortSignal | null;
+}
+
+/** Parse one ND-JSON line into stream events. Throws on ERROR messages. */
+function* parseGleanLine(line: string): Generator<GleanStreamEvent> {
+  let parsed: RawGleanChatResponse;
+  try {
+    parsed = JSON.parse(line) as RawGleanChatResponse;
+  } catch {
+    return; // tolerate keep-alives / non-JSON lines
+  }
+
+  if (parsed.chatId) yield { type: "chat_id", chatId: parsed.chatId };
+
+  for (const msg of parsed.messages ?? []) {
+    if (msg.author === "USER") continue;
+
+    // Citations live inline on fragments (current API) and on the deprecated
+    // top-level array; emit both, consumers deduplicate by URL.
+    for (const frag of msg.fragments ?? []) {
+      const doc = frag.citation?.sourceDocument;
+      if (doc?.url) yield { type: "citation", url: doc.url, title: doc.title ?? doc.url };
+    }
+    for (const cit of msg.citations ?? []) {
+      const doc = cit.sourceDocument;
+      if (doc?.url) yield { type: "citation", url: doc.url, title: doc.title ?? doc.url };
+    }
+
+    const mt = msg.messageType ?? "CONTENT";
+    const text = (msg.fragments ?? []).map((f) => f.text ?? "").join("");
+    if (mt === "ERROR") {
+      throw new Error(text || "Glean returned an error message");
+    } else if (mt === "UPDATE" || mt === "HEADING") {
+      if (text) yield { type: "thinking", text, messageId: msg.messageId };
+    } else if (mt === "CONTENT") {
+      if (text) yield { type: "content", text, messageId: msg.messageId };
+    }
+    // CONTROL_*, DEBUG*, WARNING, CONTEXT, SERVER_TOOL — ignored
+  }
+}
+
+/**
+ * POST /rest/api/v1/chat with `stream: true` and yield normalized events as the
+ * ND-JSON body arrives (one ChatResponse per line).
+ */
+async function* streamGleanChat(
+  req: GleanStreamRequest,
+): AsyncGenerator<GleanStreamEvent> {
+  const response = await fetch(`${req.baseUrl.replace(/\/+$/, "")}/rest/api/v1/chat`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${req.token}`,
+    },
+    body: JSON.stringify({
+      messages: req.messages,
+      agentConfig: req.agentConfig,
+      ...(req.chatId ? { chatId: req.chatId } : {}),
+      stream: true,
+    }),
+    signal: req.signal ?? null,
+  });
+
+  if (!response.ok) {
+    const body = await response.text().catch(() => "");
+    const hint =
+      response.status === 401
+        ? " (check GLEAN_API_TOKEN is a valid Client token with CHAT scope)"
+        : response.status === 429
+          ? " (rate limited — retry shortly)"
+          : "";
+    throw new Error(
+      `Glean API error ${response.status}${hint}: ${body.slice(0, 500)}`,
+    );
+  }
+  if (!response.body) throw new Error("Glean API returned no body");
+
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      let nl: number;
+      while ((nl = buffer.indexOf("\n")) >= 0) {
+        const line = buffer.slice(0, nl).trim();
+        buffer = buffer.slice(nl + 1);
+        if (line) yield* parseGleanLine(line);
+      }
+    }
+    buffer += decoder.decode();
+    if (buffer.trim()) yield* parseGleanLine(buffer.trim());
+  } finally {
+    // Early `break` in a consumer (abort, error) must not leak the connection.
+    await reader.cancel().catch(() => {});
+  }
+}
+
+/** Render a deduplicated citations map as a trailing markdown Sources block. */
+function sourcesBlock(citations: Map<string, string>): string {
+  if (!citations.size) return "";
+  return (
+    "\n\n**Sources:**\n" +
+    [...citations.entries()].map(([url, title]) => `- [${title}](${url})`).join("\n")
+  );
+}
+
 function streamGlean(
   model: Model<Api>,
   context: Context,
@@ -706,19 +844,6 @@ function streamGlean(
     let thinkingMsgId: string | undefined;
     let textMsgId: string | undefined;
     const citations = new Map<string, string>(); // url -> title
-
-    function collectCitations(msg: RawGleanMessage) {
-      for (const frag of msg.fragments ?? []) {
-        const doc = frag.citation?.sourceDocument;
-        if (doc?.url && !citations.has(doc.url))
-          citations.set(doc.url, doc.title ?? doc.url);
-      }
-      for (const cit of msg.citations ?? []) {
-        const doc = cit.sourceDocument;
-        if (doc?.url && !citations.has(doc.url))
-          citations.set(doc.url, doc.title ?? doc.url);
-      }
-    }
 
     function endThinking() {
       if (thinkingIndex < 0) return;
@@ -793,39 +918,34 @@ function streamGlean(
       textIndex = -1;
     }
 
-    function processLine(line: string) {
-      let parsed: RawGleanChatResponse;
-      try {
-        parsed = JSON.parse(line) as RawGleanChatResponse;
-      } catch {
-        return; // tolerate keep-alives / non-JSON lines
-      }
-      for (const msg of parsed.messages ?? []) {
-        if (msg.author === "USER") continue;
-        collectCitations(msg);
-        const mt = msg.messageType ?? "CONTENT";
-        const text = (msg.fragments ?? []).map((f) => f.text ?? "").join("");
-        if (mt === "ERROR") {
-          throw new Error(text || "Glean returned an error message");
-        } else if (mt === "UPDATE" || mt === "HEADING") {
-          if (!text) continue;
+    function processEvent(event: GleanStreamEvent) {
+      switch (event.type) {
+        case "citation":
+          if (!citations.has(event.url)) citations.set(event.url, event.title);
+          break;
+        case "thinking": {
           // New message (or first): separate from previous thinking content.
           const isNew =
             thinkingIndex < 0 ||
-            (msg.messageId !== undefined && msg.messageId !== thinkingMsgId);
-          pushThinkingDelta(isNew && thinkingIndex >= 0 ? "\n" + text : text);
-          if (msg.messageId !== undefined) thinkingMsgId = msg.messageId;
-        } else if (mt === "CONTENT") {
-          if (!text) continue;
+            (event.messageId !== undefined && event.messageId !== thinkingMsgId);
+          pushThinkingDelta(
+            isNew && thinkingIndex >= 0 ? "\n" + event.text : event.text,
+          );
+          if (event.messageId !== undefined) thinkingMsgId = event.messageId;
+          break;
+        }
+        case "content": {
           // New CONTENT message: paragraph break from previous content.
           const isNew =
             textIndex >= 0 &&
-            msg.messageId !== undefined &&
-            msg.messageId !== textMsgId;
-          pushTextDelta(isNew ? "\n\n" + text : text);
-          if (msg.messageId !== undefined) textMsgId = msg.messageId;
+            event.messageId !== undefined &&
+            event.messageId !== textMsgId;
+          pushTextDelta(isNew ? "\n\n" + event.text : event.text);
+          if (event.messageId !== undefined) textMsgId = event.messageId;
+          break;
         }
-        // CONTROL_*, DEBUG*, WARNING, CONTEXT, SERVER_TOOL — ignored
+        case "chat_id":
+          break; // the model surface is stateless; chatId is unused here
       }
     }
 
@@ -847,61 +967,20 @@ function streamGlean(
           "No Glean backend URL. Set GLEAN_BACKEND_URL or GLEAN_INSTANCE",
         );
 
-      const response = await fetch(`${baseUrl}/rest/api/v1/chat`, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${token}`,
-        },
-        body: JSON.stringify({
-          messages: buildGleanMessages(context),
-          agentConfig: reasoningAgentConfig(),
-          stream: true,
-        }),
+      for await (const event of streamGleanChat({
+        token,
+        baseUrl,
+        messages: buildGleanMessages(context),
+        agentConfig: reasoningAgentConfig(),
         signal: options?.signal ?? null,
-      });
-
-      if (!response.ok) {
-        const body = await response.text().catch(() => "");
-        const hint =
-          response.status === 401
-            ? " (check GLEAN_API_TOKEN is a valid Client token with CHAT scope)"
-            : "";
-        throw new Error(
-          `Glean API error ${response.status}${hint}: ${body.slice(0, 500)}`,
-        );
+      })) {
+        processEvent(event);
       }
-      if (!response.body) throw new Error("Glean API returned no body");
-
-      // ND-JSON: one ChatResponse per line.
-      const reader = response.body.getReader();
-      const decoder = new TextDecoder();
-      let buffer = "";
-      for (;;) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        buffer += decoder.decode(value, { stream: true });
-        let nl: number;
-        while ((nl = buffer.indexOf("\n")) >= 0) {
-          const line = buffer.slice(0, nl).trim();
-          buffer = buffer.slice(nl + 1);
-          if (line) processLine(line);
-        }
-      }
-      buffer += decoder.decode();
-      if (buffer.trim()) processLine(buffer.trim());
 
       endThinking();
 
       // Append citations as a trailing Sources block.
-      if (citations.size) {
-        const sources =
-          "\n\n**Sources:**\n" +
-          [...citations.entries()]
-            .map(([url, title]) => `- [${title}](${url})`)
-            .join("\n");
-        pushTextDelta(sources);
-      }
+      pushTextDelta(sourcesBlock(citations));
       endText();
 
       if (!output.content.length)
@@ -1061,7 +1140,7 @@ export default function (pi: ExtensionAPI) {
       ),
     }),
 
-    async execute(_toolCallId, params, _signal, onUpdate, ctx) {
+    async execute(_toolCallId, params, signal, onUpdate, ctx) {
       const token = await resolveTokenViaPi(ctx ?? piContext);
       if (!token) {
         return {
@@ -1079,64 +1158,137 @@ export default function (pi: ExtensionAPI) {
         };
       }
 
-      if (params.new_conversation) state.chatId = undefined;
-
-      onUpdate?.({
-        content: [{ type: "text", text: "Querying Glean..." }],
-        details: {},
-      });
-
-      try {
-        const response = await getClient().client.chat.create(
-          {
-            messages: [
-              { author: "USER", fragments: [{ text: params.message }] },
-            ],
-            agentConfig: reasoningAgentConfig(params.reasoning),
-            ...(state.chatId ? { chatId: state.chatId } : {}),
-          },
-          undefined, // locale
-          undefined, // timezoneOffset
-        );
-
-        if (response.chatId) {
-          state.chatId = response.chatId;
-          pi.appendEntry(STATE_ENTRY_TYPE, { chatId: response.chatId });
-        }
-
-        const messages = response.messages ?? [];
-        const text = extractAiText(messages);
-        const citations = formatCitations(messages);
-
-        return {
-          content: [
-            { type: "text", text: text + citations || "(no response)" },
-          ],
-          details: {
-            chatId: response.chatId,
-            followUpPrompts: response.followUpPrompts ?? [],
-          },
-        };
-      } catch (err: any) {
-        const status: number | undefined = err?.statusCode;
-        const message: string = err?.message ?? String(err);
-        const hint =
-          status === 401
-            ? " Check that GLEAN_API_TOKEN is a valid Client token."
-            : status === 429
-              ? " Rate limited — retry shortly."
-              : "";
+      const baseUrl = resolveGleanBaseUrl();
+      if (!baseUrl) {
         return {
           content: [
             {
               type: "text",
-              text: `Glean error${status ? ` (${status})` : ""}: ${message}${hint}`,
+              text:
+                "No Glean backend URL. " +
+                "Set GLEAN_BACKEND_URL (e.g. https://acme-be.glean.com) " +
+                "or GLEAN_INSTANCE.",
             },
           ],
           details: {},
           isError: true,
         };
       }
+
+      if (params.new_conversation) state.chatId = undefined;
+
+      // Streaming state. `answer` accumulates CONTENT text; `status` holds the
+      // most recent UPDATE/HEADING line, shown until the answer starts.
+      const citations = new Map<string, string>(); // url -> title
+      let answer = "";
+      let status = "";
+      let contentMsgId: string | undefined;
+
+      let lastUpdate = 0;
+      const emit = (force = false) => {
+        const now = Date.now();
+        if (!force && now - lastUpdate < TOOL_UPDATE_INTERVAL_MS) return;
+        lastUpdate = now;
+        onUpdate?.({
+          content: [
+            { type: "text", text: answer || status || "Querying Glean\u2026" },
+          ],
+          details: { chatId: state.chatId, streaming: true },
+        });
+      };
+      emit(true);
+
+      try {
+        for await (const event of streamGleanChat({
+          token,
+          baseUrl,
+          messages: [
+            {
+              author: "USER",
+              messageType: "CONTENT",
+              fragments: [{ text: params.message }],
+            },
+          ],
+          agentConfig: reasoningAgentConfig(params.reasoning),
+          chatId: state.chatId,
+          signal,
+        })) {
+          switch (event.type) {
+            case "chat_id":
+              if (event.chatId !== state.chatId) {
+                state.chatId = event.chatId;
+                pi.appendEntry(STATE_ENTRY_TYPE, { chatId: event.chatId });
+              }
+              break;
+            case "thinking":
+              status = event.text.trim();
+              emit();
+              break;
+            case "content": {
+              // New CONTENT message: paragraph break from previous content.
+              const isNew =
+                answer.length > 0 &&
+                event.messageId !== undefined &&
+                event.messageId !== contentMsgId;
+              answer += (isNew ? "\n\n" : "") + event.text;
+              if (event.messageId !== undefined) contentMsgId = event.messageId;
+              emit();
+              break;
+            }
+            case "citation":
+              if (!citations.has(event.url))
+                citations.set(event.url, event.title);
+              break;
+          }
+        }
+
+        const text = answer + sourcesBlock(citations);
+        return {
+          content: [{ type: "text", text: text || "(no response)" }],
+          details: { chatId: state.chatId },
+        };
+      } catch (err: any) {
+        const message: string = err?.message ?? String(err);
+        return {
+          content: [
+            {
+              type: "text",
+              text: signal?.aborted
+                ? `Glean query aborted.${answer ? `\n\nPartial answer:\n${answer}` : ""}`
+                : `Glean error: ${message}`,
+            },
+          ],
+          details: {},
+          isError: true,
+        };
+      }
+    },
+
+    // While streaming, render only a tail of the answer (or the latest status
+    // line) so the tool row stays compact; once settled or expanded, render
+    // the whole answer.
+    renderResult(result, { expanded, isPartial }, theme, context) {
+      const text = (result.content ?? [])
+        .filter((c: { type: string }) => c.type === "text")
+        .map((c: { text?: string }) => (c as { text?: string }).text ?? "")
+        .join("\n");
+      const component =
+        (context.lastComponent as Text | undefined) ?? new Text("", 0, 0);
+
+      let body = text;
+      if (isPartial && !expanded) {
+        const lines = text.split("\n");
+        const tail = lines.slice(-TOOL_PARTIAL_TAIL_LINES);
+        body = (lines.length > tail.length ? "\u2026\n" : "") + tail.join("\n");
+      }
+
+      component.setText(
+        theme.fg(
+          isPartial ? "muted" : context.isError ? "error" : "toolOutput",
+          body,
+        ),
+      );
+      return component;
     },
   });
 

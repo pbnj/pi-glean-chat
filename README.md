@@ -78,6 +78,13 @@ per-call override of the mode set by `/glean-mode` or `GLEAN_REASONING_MODE`.
 The tool's `promptGuidelines` instruct the model to use it for internal docs,
 runbooks, policies, ADRs, Jira tickets, and Confluence pages.
 
+The answer **streams into the TUI** as Glean produces it: progress lines
+(`UPDATE`/`HEADING`) show while Glean is searching, then the answer text fills in
+incrementally instead of appearing all at once when the call completes. The tool
+row shows a compact tail while streaming (press the tool-expand key for the full
+text) and the complete answer once settled. Cancelling the turn aborts the HTTP
+request and returns whatever partial answer had arrived.
+
 ### Command: `/glean <question>`
 
 Direct query without an LLM round-trip. The answer is injected as a displayed
