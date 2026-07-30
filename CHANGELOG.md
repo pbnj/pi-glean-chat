@@ -5,6 +5,20 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.3.1] - 2026-07-30
+
+### Fixed
+
+- `glean_chat` now works with OpenAI-compatible servers that only implement the
+  JSON Schema `enum` keyword. The optional `reasoning` argument was declared as
+  a union of literals, which TypeBox emits as `anyOf` + `const`. Cloud providers
+  accept that, but grammar-constrained local runtimes (llama.cpp, vLLM, and
+  similar self-hosted servers) reject the **entire request** — every turn failed
+  with a terminated stream as soon as the tool was enabled, not just the tool
+  call itself. The argument is now declared as `{ type: "string", enum: [...] }`,
+  which is equivalent for every provider and portable across all of them. No
+  change to the accepted values or to the tool's behavior.
+
 ## [1.3.0] - 2026-07-22
 
 ### Added

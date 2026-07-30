@@ -1041,17 +1041,23 @@ export default function (pi: ExtensionAPI) {
             "Start a fresh conversation thread (clears chatId). Default false.",
         }),
       ),
+      // Emitted as `{ type: "string", enum: [...] }` rather than TypeBox's
+      // `Type.Union([Type.Literal(...)])`, which produces `anyOf` + `const`.
+      // Both are valid JSON Schema and equivalent for cloud providers, but
+      // several OpenAI-compatible servers (llama.cpp, vLLM and other
+      // grammar-constrained local runtimes) only implement the `enum` keyword
+      // and fail the whole request when a tool schema contains `anyOf`.
+      // `enum` is the portable spelling, so keep it for every model.
       reasoning: Type.Optional(
-        Type.Union(
-          REASONING_MODES.map((m) => Type.Literal(m)),
-          {
-            description:
-              "Reasoning effort for this query. ADVANCED thinks longer with " +
-              "more LLM calls for deep-research questions; FAST returns quick, " +
-              "lower-effort answers; AUTO lets Glean route automatically. " +
-              "Defaults to the session/env reasoning mode.",
-          },
-        ),
+        Type.Unsafe<ReasoningMode>({
+          type: "string",
+          enum: [...REASONING_MODES],
+          description:
+            "Reasoning effort for this query. ADVANCED thinks longer with " +
+            "more LLM calls for deep-research questions; FAST returns quick, " +
+            "lower-effort answers; AUTO lets Glean route automatically. " +
+            "Defaults to the session/env reasoning mode.",
+        }),
       ),
     }),
 

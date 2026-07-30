@@ -22,6 +22,7 @@ import { after, before, beforeEach, describe, it } from "node:test";
 type Captured = {
   providerName?: string;
   providerConfig?: any;
+  tool?: any;
   commands: Record<string, any>;
   entries: any[];
   handlers: Record<string, any[]>;
@@ -34,7 +35,9 @@ const piStub = {
     captured.providerName = name;
     captured.providerConfig = cfg;
   },
-  registerTool: () => {},
+  registerTool: (cfg: any) => {
+    captured.tool = cfg;
+  },
   registerCommand: (name: string, cfg: any) => {
     captured.commands[name] = cfg;
   },
@@ -243,6 +246,34 @@ beforeEach(() => {
   oauthRegisterStatus = 201;
   tokenRequests = [];
   respond = ndjsonResponder([gleanMsg("m1", "CONTENT", "ok")]);
+});
+
+// ── Tool schema ───────────────────────────────────────────────────────────────
+
+describe("tool schema", () => {
+  it("registers the glean_chat tool", () => {
+    assert.equal(captured.tool.name, "glean_chat");
+  });
+
+  it("describes reasoning as a plain string enum", () => {
+    const reasoning = captured.tool.parameters.properties.reasoning;
+    assert.equal(reasoning.type, "string");
+    assert.deepEqual(reasoning.enum, ["FAST", "ADVANCED", "AUTO"]);
+  });
+
+  it("emits no anyOf/oneOf/allOf/const anywhere in the schema", () => {
+    // Grammar-constrained local servers (llama.cpp, vLLM, and other
+    // OpenAI-compatible runtimes) reject tool schemas using these keywords,
+    // failing the entire request rather than the single tool. Keep the schema
+    // to the portable subset so the tool works on any model.
+    const json = JSON.stringify(captured.tool.parameters);
+    for (const keyword of ["anyOf", "oneOf", "allOf", "const"]) {
+      assert.ok(
+        !json.includes(`"${keyword}"`),
+        `tool schema must not use "${keyword}": ${json}`,
+      );
+    }
+  });
 });
 
 // ── Provider registration ─────────────────────────────────────────────────────
