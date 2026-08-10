@@ -15,7 +15,11 @@
  */
 import assert from "node:assert/strict";
 import { createServer, type Server } from "node:http";
-import { after, before, beforeEach, describe, it } from "node:test";
+import { after, afterEach, before, beforeEach, describe, it } from "node:test";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { resolveGleanBaseUrl, resolveGleanToken } from "./index.ts";
 
 // ── Test doubles ──────────────────────────────────────────────────────────────
 
@@ -1019,5 +1023,115 @@ describe("oauth", () => {
         }),
       /Dynamic Client Registration may be restricted/,
     );
+  });
+});
+
+// ── Configuration resolution ──────────────────────────────────────────────────
+
+/**
+ * Env vars and ~/.pi/agent/auth.json both configure the backend. The file path is
+ * what makes the extension usable outside an interactive shell: the model surface
+ * registers only when a URL resolves, so an env-only lookup reported
+ * `Model "glean" not found` under cron, launchd and `env -i` even with a valid
+ * credential already stored in auth.json.
+ */
+describe("configuration resolution", () => {
+  const KEYS = [
+    "GLEAN_BACKEND_URL",
+    "GLEAN_INSTANCE",
+    "GLEAN_API_TOKEN",
+    "HOME",
+  ] as const;
+  let saved: Record<string, string | undefined>;
+  let home: string;
+
+  beforeEach(() => {
+    saved = Object.fromEntries(KEYS.map((k) => [k, process.env[k]])) as any;
+    for (const k of KEYS) delete process.env[k];
+    home = mkdtempSync(join(tmpdir(), "glean-cfg-"));
+    process.env.HOME = home;
+  });
+
+  afterEach(() => {
+    for (const k of KEYS) {
+      if (saved[k] === undefined) delete process.env[k];
+      else process.env[k] = saved[k]!;
+    }
+    rmSync(home, { recursive: true, force: true });
+  });
+
+  /** Write a `glean` entry into $HOME/.pi/agent/auth.json. */
+  function writeAuth(glean: unknown) {
+    const dir = join(home, ".pi", "agent");
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, "auth.json"), JSON.stringify({ glean }));
+  }
+
+  it("resolves the URL from GLEAN_BACKEND_URL", () => {
+    process.env.GLEAN_BACKEND_URL = "https://acme-be.glean.com";
+    assert.equal(resolveGleanBaseUrl(), "https://acme-be.glean.com");
+  });
+
+  it("derives the URL from GLEAN_INSTANCE", () => {
+    process.env.GLEAN_INSTANCE = "acme";
+    assert.equal(resolveGleanBaseUrl(), "https://acme-be.glean.com");
+  });
+
+  it("resolves the URL from auth.json env.GLEAN_BACKEND_URL with no env vars", () => {
+    writeAuth({ type: "oauth", access: "t", env: { GLEAN_BACKEND_URL: "https://from-file-be.glean.com" } });
+    assert.equal(resolveGleanBaseUrl(), "https://from-file-be.glean.com");
+  });
+
+  it("derives the URL from auth.json env.GLEAN_INSTANCE", () => {
+    writeAuth({ type: "api_key", key: "k", env: { GLEAN_INSTANCE: "acme" } });
+    assert.equal(resolveGleanBaseUrl(), "https://acme-be.glean.com");
+  });
+
+  it("accepts a bare backendUrl / instance on the auth entry", () => {
+    writeAuth({ type: "api_key", key: "k", backendUrl: "https://bare-be.glean.com" });
+    assert.equal(resolveGleanBaseUrl(), "https://bare-be.glean.com");
+    writeAuth({ type: "api_key", key: "k", instance: "bare" });
+    assert.equal(resolveGleanBaseUrl(), "https://bare-be.glean.com");
+  });
+
+  it("prefers env over auth.json", () => {
+    writeAuth({ type: "api_key", key: "k", env: { GLEAN_BACKEND_URL: "https://file-be.glean.com" } });
+    process.env.GLEAN_BACKEND_URL = "https://env-be.glean.com";
+    assert.equal(resolveGleanBaseUrl(), "https://env-be.glean.com");
+  });
+
+  it("returns undefined when nothing configures a URL", () => {
+    assert.equal(resolveGleanBaseUrl(), undefined);
+    writeAuth({ type: "api_key", key: "k" });
+    assert.equal(resolveGleanBaseUrl(), undefined);
+  });
+
+  it("normalizes trailing slashes and a /rest/api/v1 suffix", () => {
+    process.env.GLEAN_BACKEND_URL = "https://acme-be.glean.com/rest/api/v1";
+    assert.equal(resolveGleanBaseUrl(), "https://acme-be.glean.com");
+    process.env.GLEAN_BACKEND_URL = "https://acme-be.glean.com///";
+    assert.equal(resolveGleanBaseUrl(), "https://acme-be.glean.com");
+  });
+
+  it("reads the file fresh each call, so /login and OAuth refresh are picked up", () => {
+    writeAuth({ type: "api_key", key: "first" });
+    assert.equal(resolveGleanToken(), "first");
+    writeAuth({ type: "api_key", key: "second" });
+    assert.equal(resolveGleanToken(), "second");
+  });
+
+  it("still prefers an explicit token, then env, then the file", () => {
+    writeAuth({ type: "api_key", key: "from-file" });
+    assert.equal(resolveGleanToken(), "from-file");
+    process.env.GLEAN_API_TOKEN = "from-env";
+    assert.equal(resolveGleanToken(), "from-env");
+    assert.equal(resolveGleanToken("explicit"), "explicit");
+  });
+
+  it("ignores an expired OAuth entry but accepts env.GLEAN_API_TOKEN from the file", () => {
+    writeAuth({ type: "oauth", access: "stale", expires: 1 });
+    assert.equal(resolveGleanToken(), "");
+    writeAuth({ type: "oauth", access: "stale", expires: 1, env: { GLEAN_API_TOKEN: "fallback" } });
+    assert.equal(resolveGleanToken(), "fallback");
   });
 });

@@ -57,38 +57,63 @@ import type { ChatMessage } from "@gleanwork/api-client/models/components";
 // ── Client ────────────────────────────────────────────────────────────────────
 
 /**
- * Resolve the Glean API token with the following precedence:
- *   1. Explicit argument (passed by the caller)
- *   2. GLEAN_API_TOKEN env var
- *   3. ~/.pi/agent/auth.json  glean entry (api_key, or unexpired oauth access)
+ * The `glean` entry from ~/.pi/agent/auth.json, or undefined.
+ *
+ * Read on demand rather than cached: `/login` and OAuth refresh rewrite this file
+ * mid-session, and a stale copy would pin an expired token.
  */
-function resolveGleanToken(explicit?: string): string {
-  if (explicit) return explicit;
-  if (process.env.GLEAN_API_TOKEN) return process.env.GLEAN_API_TOKEN;
+function readGleanAuthEntry(): Record<string, unknown> | undefined {
   try {
     const authPath = join(homedir(), ".pi", "agent", "auth.json");
     const auth = JSON.parse(readFileSync(authPath, "utf-8")) as Record<
       string,
       unknown
     >;
-    const glean = auth?.glean as Record<string, unknown> | undefined;
-    if (
-      glean?.type === "api_key" &&
-      typeof glean?.key === "string" &&
-      glean.key
-    )
-      return glean.key;
-    if (
-      glean?.type === "oauth" &&
-      typeof glean?.access === "string" &&
-      glean.access &&
-      (typeof glean?.expires !== "number" || glean.expires > Date.now())
-    )
-      return glean.access;
+    return auth?.glean as Record<string, unknown> | undefined;
   } catch {
-    // auth.json absent or unreadable — fall through
+    // auth.json absent or unreadable
+    return undefined;
   }
-  return "";
+}
+
+/**
+ * A per-provider env override from auth.json, e.g.
+ *   "glean": { "type": "oauth", …, "env": { "GLEAN_BACKEND_URL": "https://…" } }
+ *
+ * This mirrors how pi already stores provider-local settings (the `llama.cpp`
+ * entry carries `env.LLAMA_BASE_URL`), so configuration lives beside the
+ * credential instead of depending on the shell that launched pi.
+ */
+function authEnv(
+  entry: Record<string, unknown> | undefined,
+  name: string,
+): string | undefined {
+  const env = entry?.env as Record<string, unknown> | undefined;
+  const value = env?.[name];
+  return typeof value === "string" && value ? value : undefined;
+}
+
+/**
+ * Resolve the Glean API token with the following precedence:
+ *   1. Explicit argument (passed by the caller)
+ *   2. GLEAN_API_TOKEN env var
+ *   3. ~/.pi/agent/auth.json  glean entry (api_key, or unexpired oauth access,
+ *      or an env.GLEAN_API_TOKEN override)
+ */
+export function resolveGleanToken(explicit?: string): string {
+  if (explicit) return explicit;
+  if (process.env.GLEAN_API_TOKEN) return process.env.GLEAN_API_TOKEN;
+  const glean = readGleanAuthEntry();
+  if (glean?.type === "api_key" && typeof glean?.key === "string" && glean.key)
+    return glean.key;
+  if (
+    glean?.type === "oauth" &&
+    typeof glean?.access === "string" &&
+    glean.access &&
+    (typeof glean?.expires !== "number" || glean.expires > Date.now())
+  )
+    return glean.access;
+  return authEnv(glean, "GLEAN_API_TOKEN") ?? "";
 }
 
 /**
@@ -112,8 +137,12 @@ async function resolveTokenViaPi(
 let piContext: Pick<ExtensionContext, "modelRegistry"> | undefined;
 
 function makeClient(): Glean {
-  const serverURL = process.env.GLEAN_BACKEND_URL;
-  const instance = process.env.GLEAN_INSTANCE;
+  // Same resolution as the model surface (env, then auth.json), so the tool and
+  // the provider can never disagree about which backend they are talking to.
+  const serverURL = resolveGleanBaseUrl();
+  const instance =
+    process.env.GLEAN_INSTANCE ??
+    authEnv(readGleanAuthEntry(), "GLEAN_INSTANCE");
   return new Glean({
     // Async provider: resolved per request, so OAuth refresh via pi's auth
     // storage is picked up without rebuilding the client.
@@ -593,11 +622,32 @@ async function refreshGleanToken(
 //   - System prompt, tool schemas, and tool results are stripped from context.
 //   - No token usage data; cost stays zero.
 
-/** Resolve the Glean backend base URL from env, normalized (no trailing /). */
-function resolveGleanBaseUrl(): string | undefined {
+/**
+ * Resolve the Glean backend base URL, normalized (no trailing /), with the same
+ * precedence the token uses:
+ *   1. GLEAN_BACKEND_URL / GLEAN_INSTANCE env vars
+ *   2. ~/.pi/agent/auth.json  glean entry: env.GLEAN_BACKEND_URL,
+ *      env.GLEAN_INSTANCE, backendUrl, or instance
+ *
+ * The file fallback matters because the model surface is registered only when a
+ * URL resolves (see the entry point). Env-only resolution meant pi worked in an
+ * interactive shell and reported `Model "glean" not found` anywhere the profile
+ * had not been sourced -- cron, launchd, a bare `env -i` -- even with a perfectly
+ * good credential sitting in auth.json.
+ */
+export function resolveGleanBaseUrl(): string | undefined {
   let url = process.env.GLEAN_BACKEND_URL;
-  if (!url && process.env.GLEAN_INSTANCE)
-    url = `https://${process.env.GLEAN_INSTANCE}-be.glean.com`;
+  let instance = process.env.GLEAN_INSTANCE;
+  if (!url && !instance) {
+    const glean = readGleanAuthEntry();
+    url =
+      authEnv(glean, "GLEAN_BACKEND_URL") ??
+      (typeof glean?.backendUrl === "string" ? glean.backendUrl : undefined);
+    instance =
+      authEnv(glean, "GLEAN_INSTANCE") ??
+      (typeof glean?.instance === "string" ? glean.instance : undefined);
+  }
+  if (!url && instance) url = `https://${instance}-be.glean.com`;
   if (!url) return undefined;
   url = url.replace(/\/+$/, "");
   url = url.replace(/\/rest\/api\/v1$/, "");
