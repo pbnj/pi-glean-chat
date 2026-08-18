@@ -5,6 +5,37 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.5.0] - 2026-08-17
+
+### Added
+
+- The Glean backend URL now falls back to the `glean` entry in
+  `~/.pi/agent/auth.json` (`env.GLEAN_BACKEND_URL`, `env.GLEAN_INSTANCE`, or a
+  bare `backendUrl` / `instance`) when neither environment variable is set,
+  mirroring how pi already stores provider-local settings such as the
+  `llama.cpp` entry's `env.LLAMA_BASE_URL`. Environment variables still win.
+  The model surface registers only when a URL resolves, so env-only resolution
+  meant pi worked in an interactive shell but reported `Model "glean" not
+  found` anywhere the profile had not been sourced — cron, launchd, a bare
+  `env -i` — even with a valid credential already stored in `auth.json`. The
+  auth entry is read on demand rather than cached, since `/login` and OAuth
+  refresh rewrite the file mid-session, and `makeClient()` shares the same
+  resolution so the tool and the provider cannot disagree about the backend.
+
+### Removed
+
+- **The `FAST` reasoning mode is gone.** Glean's `FAST` agent is unreliable
+  enough to return erroneous answers, so it is no longer selectable from any
+  surface: it is dropped from the `glean_chat` `reasoning` enum, from
+  `/glean-mode` and its completions, and from the `GLEAN_REASONING_MODE`
+  values. The remaining modes are `ADVANCED` and `AUTO` (still defaulting to
+  `AUTO`), and `/glean-mode` with no argument now toggles between the two
+  instead of cycling three.
+- A `FAST` value surviving in persisted session state, in
+  `GLEAN_REASONING_MODE`, or in a model-invented `reasoning` tool argument is
+  ignored and falls back to the session/env default rather than reaching the
+  retired agent.
+
 ## [1.4.0] - 2026-07-30
 
 ### Added
@@ -108,6 +139,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Initial release of the pi-glean-chat extension.
 - OAuth login via the Glean Authorization Server.
 
+[1.5.0]: https://github.com/pbnj/pi-glean-chat/releases/tag/v1.5.0
+[1.4.0]: https://github.com/pbnj/pi-glean-chat/releases/tag/v1.4.0
+[1.3.1]: https://github.com/pbnj/pi-glean-chat/releases/tag/v1.3.1
+[1.3.0]: https://github.com/pbnj/pi-glean-chat/releases/tag/v1.3.0
 [1.2.0]: https://github.com/pbnj/pi-glean-chat/releases/tag/v1.2.0
 [1.1.0]: https://github.com/pbnj/pi-glean-chat/releases/tag/v1.1.0
 [1.0.0]: https://github.com/pbnj/pi-glean-chat/releases/tag/v1.0.0

@@ -262,7 +262,7 @@ describe("tool schema", () => {
   it("describes reasoning as a plain string enum", () => {
     const reasoning = captured.tool.parameters.properties.reasoning;
     assert.equal(reasoning.type, "string");
-    assert.deepEqual(reasoning.enum, ["FAST", "ADVANCED", "AUTO"]);
+    assert.deepEqual(reasoning.enum, ["ADVANCED", "AUTO"]);
   });
 
   it("emits no anyOf/oneOf/allOf/const anywhere in the schema", () => {
@@ -416,9 +416,9 @@ describe("reasoning mode", () => {
     assert.deepEqual(lastRequestBody.agentConfig, { agent: "ADVANCED" });
   });
 
-  it("cycles to the next mode when given no argument", async () => {
+  it("toggles to the other mode when given no argument", async () => {
     const ctx = makeCommandCtx();
-    // Start from a known state: advanced -> auto -> fast -> advanced.
+    // Start from a known state: advanced -> auto -> advanced.
     await captured.commands["glean-mode"].handler("advanced", ctx);
     await captured.commands["glean-mode"].handler("", ctx);
     await runStream({ messages: [userMsg("hi")] });
@@ -426,12 +426,12 @@ describe("reasoning mode", () => {
 
     await captured.commands["glean-mode"].handler("", ctx);
     await runStream({ messages: [userMsg("hi")] });
-    assert.deepEqual(lastRequestBody.agentConfig, { agent: "FAST" });
+    assert.deepEqual(lastRequestBody.agentConfig, { agent: "ADVANCED" });
   });
 
   it("rejects an invalid mode without changing state", async () => {
     const ctx = makeCommandCtx();
-    await captured.commands["glean-mode"].handler("fast", ctx);
+    await captured.commands["glean-mode"].handler("advanced", ctx);
     await captured.commands["glean-mode"].handler("turbo", ctx);
     assert.ok(
       ctx.notes.some(
@@ -439,7 +439,20 @@ describe("reasoning mode", () => {
       ),
     );
     await runStream({ messages: [userMsg("hi")] });
-    assert.deepEqual(lastRequestBody.agentConfig, { agent: "FAST" });
+    assert.deepEqual(lastRequestBody.agentConfig, { agent: "ADVANCED" });
+  });
+
+  it("rejects the retired fast mode", async () => {
+    const ctx = makeCommandCtx();
+    await captured.commands["glean-mode"].handler("advanced", ctx);
+    await captured.commands["glean-mode"].handler("fast", ctx);
+    assert.ok(
+      ctx.notes.some(
+        (n: any) => n.level === "error" && n.message.includes("fast"),
+      ),
+    );
+    await runStream({ messages: [userMsg("hi")] });
+    assert.deepEqual(lastRequestBody.agentConfig, { agent: "ADVANCED" });
   });
 
   it("persists the selected mode via appendEntry", async () => {
@@ -487,8 +500,10 @@ describe("reasoning mode", () => {
       { model: { id: "glean-assistant", provider: "glean" } },
       ctx,
     );
-    await captured.commands["glean-mode"].handler("fast", ctx);
-    assert.ok(renderFooter(ctx.getFooter())[1].includes("\u2022 fast"));
+    await captured.commands["glean-mode"].handler("auto", ctx);
+    assert.ok(renderFooter(ctx.getFooter())[1].includes("\u2022 auto"));
+    await captured.commands["glean-mode"].handler("advanced", ctx);
+    assert.ok(renderFooter(ctx.getFooter())[1].includes("\u2022 advanced"));
   });
 
   it("restores the built-in footer when switching away from Glean", async () => {
@@ -524,8 +539,9 @@ describe("reasoning mode", () => {
     const all = await cmd.getArgumentCompletions("");
     assert.deepEqual(
       all.map((i: any) => i.value).sort(),
-      ["advanced", "auto", "fast"],
+      ["advanced", "auto"],
     );
+    assert.ok(!all.some((i: any) => i.value === "fast"));
     const a = await cmd.getArgumentCompletions("a");
     assert.deepEqual(
       a.map((i: any) => i.value).sort(),
@@ -857,6 +873,13 @@ describe("tool streaming", () => {
     respond = ndjsonResponder([gleanMsg("c1", "CONTENT", "a")]);
     await runTool({ message: "q", reasoning: "ADVANCED", new_conversation: true });
     assert.deepEqual(lastRequestBody.agentConfig, { agent: "ADVANCED" });
+  });
+
+  it("ignores a retired FAST override and uses the session mode", async () => {
+    await captured.commands["glean-mode"].handler("auto", makeCommandCtx());
+    respond = ndjsonResponder([gleanMsg("c1", "CONTENT", "a")]);
+    await runTool({ message: "q", reasoning: "FAST", new_conversation: true });
+    assert.deepEqual(lastRequestBody.agentConfig, { agent: "AUTO" });
   });
 
   it("appends a deduplicated Sources block", async () => {

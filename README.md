@@ -61,7 +61,7 @@ mock Glean backend.
 | `GLEAN_INSTANCE`             | one of   | Instance name, e.g. `mycompany` — used when `GLEAN_BACKEND_URL` is absent |
 | `GLEAN_API_TOKEN`            | no       | Glean Client API token — overrides the token stored in `auth.json`        |
 | `GLEAN_ENABLE_MODEL_SURFACE` | no       | Set to `0` to disable the provider/model surface                          |
-| `GLEAN_REASONING_MODE`       | no       | Default reasoning mode: `fast`, `advanced`, or `auto` (default `auto`)    |
+| `GLEAN_REASONING_MODE`       | no       | Default reasoning mode: `advanced` or `auto` (default `auto`)             |
 
 ## Surfaces
 
@@ -71,9 +71,9 @@ The LLM can call `glean_chat` to answer questions about internal knowledge.
 Conversations are threaded — follow-up calls continue the same Glean chat
 session via `chatId`. Pass `new_conversation: true` to start a fresh thread.
 
-Pass `reasoning: "ADVANCED"` for deep-research questions or `reasoning: "FAST"`
-for quick answers; omit it to use the session/env reasoning mode. This is a
-per-call override of the mode set by `/glean-mode` or `GLEAN_REASONING_MODE`.
+Pass `reasoning: "ADVANCED"` for deep-research questions; omit it to use the
+session/env reasoning mode. This is a per-call override of the mode set by
+`/glean-mode` or `GLEAN_REASONING_MODE`.
 
 The tool's `promptGuidelines` instruct the model to use it for internal docs,
 runbooks, policies, ADRs, Jira tickets, and Confluence pages.
@@ -97,7 +97,7 @@ session message so subsequent LLM turns can reference it.
 
 `--new` clears the current `chatId` and starts a fresh conversation thread.
 
-### Command: `/glean-mode [fast|advanced|auto]`
+### Command: `/glean-mode [advanced|auto]`
 
 View, set, or toggle the reasoning mode used for every Glean chat request
 (applies to the tool, the `/glean` command, and the model surface). The mode maps
@@ -105,19 +105,24 @@ to Glean's `agentConfig.agent`:
 
 | Mode       | Behavior                                                        |
 | ---------- | -------------------------------------------------------------- |
-| `fast`     | Agentic engine; faster, lower-quality results                  |
 | `advanced` | Agentic engine; thinks longer, more LLM calls, higher quality  |
 | `auto`     | Agentic engine; routes reasoning effort by question/context    |
 
 ```plaintext
-/glean-mode              # cycle to the next mode and report it
+/glean-mode              # toggle to the other mode and report it
 /glean-mode advanced     # set a specific mode
 ```
 
-With no argument the command cycles `fast -> advanced -> auto -> fast`. The
+With no argument the command toggles between `advanced` and `auto`. The
 selection is persisted in session state and survives `/reload`. The startup
-default comes from `GLEAN_REASONING_MODE` (or `auto` if unset). These agents
-require the agentic engine to be enabled in your Glean deployment.
+default comes from `GLEAN_REASONING_MODE` (or `auto` if unset, or if it names
+an unknown mode). These agents require the agentic engine to be enabled in your
+Glean deployment.
+
+Glean's `FAST` agent is not exposed by this extension: it is unreliable enough
+to return erroneous answers, so neither the LLM nor `/glean-mode` can select it.
+A `FAST` value left over in an old session or in `GLEAN_REASONING_MODE` is
+ignored and falls back to `auto`.
 
 While the `glean / Glean Assistant` model is selected, the footer is replaced
 with a compact Glean footer whose model line reads

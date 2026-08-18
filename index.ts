@@ -10,7 +10,7 @@
  *   2. /glean command   — interactive query with no LLM round-trip.
  *                         Answer injected as a displayed session message.
  *                         /glean --new <question> resets the thread.
- *                         /glean-mode [fast|advanced|auto] sets the reasoning
+ *                         /glean-mode [advanced|auto] sets the reasoning
  *                         mode used by all surfaces (default via
  *                         GLEAN_REASONING_MODE, else auto).
  *
@@ -180,13 +180,15 @@ const TOOL_PARTIAL_TAIL_LINES = 8;
 // Selects the Glean agent that executes a chat request (agentConfig.agent).
 // Only the agentic-engine agents are exposed here; they require the agentic
 // engine to be enabled in the Glean deployment.
-//   FAST     — faster, lower-quality results.
 //   ADVANCED — thinks longer, more LLM calls, higher-quality results.
 //   AUTO     — routes between reasoning efforts based on the question/context.
+//
+// Glean's FAST agent is deliberately not exposed: it is unreliable and returns
+// erroneous answers often enough that no caller should be able to select it.
 
-type ReasoningMode = "FAST" | "ADVANCED" | "AUTO";
+type ReasoningMode = "ADVANCED" | "AUTO";
 
-const REASONING_MODES: readonly ReasoningMode[] = ["FAST", "ADVANCED", "AUTO"];
+const REASONING_MODES: readonly ReasoningMode[] = ["ADVANCED", "AUTO"];
 
 /** Parse a user-supplied string into a ReasoningMode (case-insensitive). */
 function normalizeReasoningMode(input: string): ReasoningMode | undefined {
@@ -203,17 +205,29 @@ function defaultReasoningMode(): ReasoningMode {
   );
 }
 
-/** Active mode: session override (via /glean-mode) or the env/default. */
+/**
+ * Active mode: session override (via /glean-mode) or the env/default.
+ *
+ * The session value is re-validated because it is restored verbatim from
+ * session entries, which may have been written by a build that still offered
+ * the retired FAST mode.
+ */
 function currentReasoningMode(): ReasoningMode {
-  return state.reasoningMode ?? defaultReasoningMode();
+  const session = state.reasoningMode
+    ? normalizeReasoningMode(state.reasoningMode)
+    : undefined;
+  return session ?? defaultReasoningMode();
 }
 
 /**
  * agentConfig payload applied to a Glean chat request. An explicit `override`
- * (e.g. a per-call `reasoning` tool argument) wins over the session/env mode.
+ * (e.g. a per-call `reasoning` tool argument) wins over the session/env mode,
+ * but only if it names a mode we still support — a model that invents FAST
+ * falls back to the session default rather than reaching the retired agent.
  */
-function reasoningAgentConfig(override?: ReasoningMode): { agent: ReasoningMode } {
-  return { agent: override ?? currentReasoningMode() };
+function reasoningAgentConfig(override?: string): { agent: ReasoningMode } {
+  const explicit = override ? normalizeReasoningMode(override) : undefined;
+  return { agent: explicit ?? currentReasoningMode() };
 }
 
 // State captured from session/model events so the custom footer can render the
@@ -1138,8 +1152,7 @@ export default function (pi: ExtensionAPI) {
       "e.g. 'print the raw contents of <url>' or 'print the first 100 lines " +
       "of <url>'. Conversations are threaded — follow-up calls continue the " +
       "same chat session unless new_conversation is true. Pass reasoning: " +
-      "ADVANCED for deep-research questions or reasoning: FAST for quick " +
-      "answers.",
+      "ADVANCED for deep-research questions.",
     promptSnippet:
       "Query Glean AI for internal AND external knowledge (private company " +
       "resources and public internet)",
@@ -1157,8 +1170,7 @@ export default function (pi: ExtensionAPI) {
         "you genuinely need exact content, ask explicitly, e.g. 'print the raw " +
         "contents of <url>' or 'print the first 100 lines of <url>'.",
       "Set reasoning: ADVANCED for deep-research or multi-step questions that " +
-        "benefit from longer thinking, and reasoning: FAST for simple lookups " +
-        "where a quick answer is enough; omit it to use the session default.",
+        "benefit from longer thinking; omit it to use the session default.",
     ],
     parameters: Type.Object({
       message: Type.String({
@@ -1183,9 +1195,8 @@ export default function (pi: ExtensionAPI) {
           enum: [...REASONING_MODES],
           description:
             "Reasoning effort for this query. ADVANCED thinks longer with " +
-            "more LLM calls for deep-research questions; FAST returns quick, " +
-            "lower-effort answers; AUTO lets Glean route automatically. " +
-            "Defaults to the session/env reasoning mode.",
+            "more LLM calls for deep-research questions; AUTO lets Glean " +
+            "route automatically. Defaults to the session/env reasoning mode.",
         }),
       ),
     }),
@@ -1427,7 +1438,7 @@ export default function (pi: ExtensionAPI) {
   pi.registerCommand("glean-mode", {
     description:
       "View, set, or toggle the Glean reasoning mode. " +
-      "Usage: /glean-mode [fast|advanced|auto]  (no arg cycles to the next mode)",
+      "Usage: /glean-mode [advanced|auto]  (no arg toggles to the other mode)",
     getArgumentCompletions: (prefix) => {
       const p = prefix.trim().toLowerCase();
       return REASONING_MODES.filter((m) =>
@@ -1436,11 +1447,9 @@ export default function (pi: ExtensionAPI) {
         value: m.toLowerCase(),
         label: m.toLowerCase(),
         description:
-          m === "FAST"
-            ? "Faster, lower-quality results"
-            : m === "ADVANCED"
-              ? "Thinks longer, higher-quality results"
-              : "Routes reasoning effort automatically",
+          m === "ADVANCED"
+            ? "Thinks longer, higher-quality results"
+            : "Routes reasoning effort automatically",
       }));
     },
     handler: async (args, ctx) => {
@@ -1448,7 +1457,7 @@ export default function (pi: ExtensionAPI) {
 
       let mode: ReasoningMode;
       if (!arg) {
-        // No argument: cycle to the next mode.
+        // No argument: toggle to the other mode.
         const idx = REASONING_MODES.indexOf(currentReasoningMode());
         mode = REASONING_MODES[(idx + 1) % REASONING_MODES.length];
       } else {
