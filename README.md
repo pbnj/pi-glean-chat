@@ -50,8 +50,9 @@ Unit tests (`index.test.ts`) run with the built-in Node test runner (Node >=
 23.6 for native type stripping). They cover request building (most-recent-first
 ordering, author mapping, merging, context stripping), ND-JSON stream parsing
 (fragment reassembly per messageId, thinking/text interleaving, citations,
-errors, abort), and the OAuth flow (DCR, PKCE code exchange, refresh) against a
-mock Glean backend.
+errors, abort), the OAuth flow (DCR, PKCE code exchange, refresh), and the
+hand-off commands (transcript rendering, `saveChat`, chat-link derivation,
+loading a chat back in) against a mock Glean backend.
 
 ## Environment variables
 
@@ -62,6 +63,9 @@ mock Glean backend.
 | `GLEAN_API_TOKEN`            | no       | Glean Client API token — overrides the token stored in `auth.json`        |
 | `GLEAN_ENABLE_MODEL_SURFACE` | no       | Set to `0` to disable the provider/model surface                          |
 | `GLEAN_REASONING_MODE`       | no       | Default reasoning mode: `advanced` or `auto` (default `auto`)             |
+| `GLEAN_WEB_URL`              | no       | Glean web app URL used to build chat links (default `https://app.glean.com`) |
+| `GLEAN_SAVE_CHATS`           | no       | Set to `1` to persist every tool / `/glean` request as a Glean chat       |
+| `GLEAN_TRANSCRIPT_MAX_CHARS` | no       | Cap on the transcript `/glean-save` sends (default `60000`)               |
 
 ## Surfaces
 
@@ -96,6 +100,40 @@ session message so subsequent LLM turns can reference it.
 ```
 
 `--new` clears the current `chatId` and starts a fresh conversation thread.
+
+### Hand-off: `/glean-save`, `/glean-url`, `/glean-load`
+
+Chats created through the Glean API are **transient** unless `saveChat` is set —
+they have a `chatId` but no page on glean.com. These three commands make the
+round trip explicit.
+
+```plaintext
+/glean-save                      # push this session to Glean, print the link
+/glean-save --new                # into a fresh Glean chat, not the current thread
+/glean-save --full               # ignore the transcript size cap
+/glean-save summarize the open questions   # your own instruction instead of the default
+/glean-url                       # print (and copy) the link for the current chat
+/glean-load <chatId | URL>       # pull a Glean chat back into this session
+```
+
+`/glean-save` renders the current session branch as a markdown transcript and
+sends it as a single `USER` message with `saveChat: true`. User and assistant
+prose is kept; tool calls collapse to one-line markers (`_[tool: bash — npm
+test]_`) and tool output, thinking blocks, and the system prompt are dropped.
+Answers previously injected by `/glean` are included. When the transcript exceeds
+`GLEAN_TRANSCRIPT_MAX_CHARS` (default 60 000) the **oldest** turns are dropped
+first and the message says so. Glean's reply — by default a recap of where you
+left off — plus the chat link are injected into the session, and the link is
+copied to the clipboard.
+
+`/glean-load` accepts a bare chat id or any `…/chat/<id>` URL, injects the web
+conversation into the local session, and adopts its `chatId`, so subsequent
+`glean_chat` / `/glean` calls continue that same Glean chat.
+
+Chat links point at `https://app.glean.com/chat/<chatId>` — the web app is served
+from that one host, not a per-tenant one. Glean's API exposes no link for a Chat,
+so this is a convention rather than a contract; override it with `GLEAN_WEB_URL`
+if your tenant differs.
 
 ### Command: `/glean-mode [advanced|auto]`
 
@@ -160,6 +198,11 @@ surfaces.
 the thread survives `/reload`. It is shared between the tool and the `/glean`
 command. The provider (model) surface does not use `chatId` — it forwards the
 full conversation history to Glean on every turn.
+
+Whether a thread is *saved* is tracked alongside the `chatId`: `/glean-save` and
+`/glean-load` always mark it saved, the tool and `/glean` do so only under
+`GLEAN_SAVE_CHATS=1`. `/glean-url` refuses to hand out a link for an unsaved
+thread rather than printing one that 404s.
 
 ## Token source
 

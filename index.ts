@@ -33,6 +33,7 @@ import type {
   ExtensionAPI,
   ExtensionContext,
   ExtensionUIContext,
+  SessionEntry,
 } from "@earendil-works/pi-coding-agent";
 import {
   type Api,
@@ -164,6 +165,12 @@ function getClient(): Glean {
 interface GleanState {
   chatId?: string; // tool + /glean command thread
   reasoningMode?: ReasoningMode; // agentic engine reasoning effort
+  /**
+   * True once the thread has been persisted server-side (`saveChat: true`), and
+   * so is visible and resumable on glean.com. Transient chats also have a
+   * chatId, but no web page — /glean-url needs to tell the two apart.
+   */
+  saved?: boolean;
 }
 
 let state: GleanState = {};
@@ -668,6 +675,54 @@ export function resolveGleanBaseUrl(): string | undefined {
   return url;
 }
 
+/**
+ * The Glean web app. Chat pages live at <host>/chat/<chatId>; the UI is served
+ * from this single host rather than a per-tenant one (a tenant-derived host such
+ * as https://<instance>.glean.com does not resolve to the chat page).
+ */
+const GLEAN_WEB_URL_DEFAULT = "https://app.glean.com";
+
+/**
+ * Resolve the Glean *web app* base URL — where a saved chat is readable in a
+ * browser — normalized (no trailing /):
+ *   1. GLEAN_WEB_URL env var
+ *   2. ~/.pi/agent/auth.json  glean entry: env.GLEAN_WEB_URL
+ *   3. app.glean.com
+ *
+ * Glean's API exposes no link to a Chat, so the default is a convention, not a
+ * documented contract. Override it with GLEAN_WEB_URL if a tenant differs.
+ */
+export function resolveGleanWebUrl(): string {
+  const explicit =
+    process.env.GLEAN_WEB_URL ?? authEnv(readGleanAuthEntry(), "GLEAN_WEB_URL");
+  return (explicit || GLEAN_WEB_URL_DEFAULT).replace(/\/+$/, "");
+}
+
+/** Browser link for a saved Glean chat. */
+export function gleanChatUrl(chatId: string): string {
+  return `${resolveGleanWebUrl()}/chat/${chatId}`;
+}
+
+/** Extract a chat id from a bare id or any Glean URL containing /chat/<id>. */
+export function parseChatId(input: string): string | undefined {
+  const raw = input.trim();
+  if (!raw) return undefined;
+  const fromUrl = /\/chat\/(?:agents\/)?([A-Za-z0-9_-]+)/.exec(raw);
+  if (fromUrl) return fromUrl[1];
+  return /^[A-Za-z0-9_-]+$/.test(raw) ? raw : undefined;
+}
+
+/**
+ * Whether requests from the tool and /glean should be persisted as Glean chats.
+ *
+ * Off by default: every question the LLM asks mid-task would otherwise land in
+ * the user's Glean chat history. /glean-save always saves regardless.
+ */
+function shouldSaveChat(): boolean {
+  const v = (process.env.GLEAN_SAVE_CHATS ?? "").trim().toLowerCase();
+  return v === "1" || v === "true" || v === "yes";
+}
+
 interface RawSourceDocument {
   title?: string;
   url?: string;
@@ -696,6 +751,20 @@ interface GleanRequestMessage {
 }
 
 /**
+ * Flatten a pi message's content to plain text: text parts only, joined by
+ * newlines. Images, thinking blocks, and tool calls are dropped — Glean takes
+ * prose. Shared by the model surface and the transcript builder.
+ */
+function textOf(content: unknown): string {
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return "";
+  return content
+    .filter((c) => (c as { type?: string })?.type === "text")
+    .map((c) => (c as { text?: string }).text ?? "")
+    .join("\n");
+}
+
+/**
  * Map pi Context → Glean ChatMessage[].
  * Only user/assistant text survives; system prompt and tool traffic dropped.
  * Consecutive same-author messages are merged (Glean expects alternation).
@@ -717,20 +786,9 @@ function buildGleanMessages(context: Context): GleanRequestMessage[] {
 
   for (const msg of context.messages) {
     if (msg.role === "user") {
-      const text =
-        typeof msg.content === "string"
-          ? msg.content
-          : msg.content
-              .filter((c) => c.type === "text")
-              .map((c) => (c as { text: string }).text)
-              .join("\n");
-      push("USER", text);
+      push("USER", textOf(msg.content));
     } else if (msg.role === "assistant") {
-      const text = msg.content
-        .filter((c) => c.type === "text")
-        .map((c) => (c as { text: string }).text)
-        .join("\n");
-      push("GLEAN_AI", text);
+      push("GLEAN_AI", textOf(msg.content));
     }
     // toolResult messages are dropped — Glean has no tool concept.
   }
@@ -741,6 +799,132 @@ function buildGleanMessages(context: Context): GleanRequestMessage[] {
     push("USER", "(continue)");
 
   return out.reverse();
+}
+
+// ── Transcript (session → markdown) ──────────────────────────────────────────
+//
+// Renders the local pi conversation as markdown so it can be handed to Glean as
+// a single USER message (see /glean-save). Prose is what Glean can act on, so
+// tool traffic collapses to one-line markers rather than being reproduced: the
+// point is for Glean — and the human reading it on glean.com — to know what was
+// asked, answered, and touched, not to replay the tool output.
+
+/** Default cap on transcript size; overridable per call and by env var. */
+const TRANSCRIPT_MAX_CHARS = 60_000;
+
+function defaultTranscriptMaxChars(): number {
+  const raw = Number.parseInt(process.env.GLEAN_TRANSCRIPT_MAX_CHARS ?? "", 10);
+  return Number.isFinite(raw) && raw > 0 ? raw : TRANSCRIPT_MAX_CHARS;
+}
+
+/** One-line, length-capped summary of a tool call's arguments. */
+function summarizeToolArgs(args: Record<string, unknown> | undefined): string {
+  if (!args) return "";
+  // The salient argument first — these cover pi's built-in tools; anything else
+  // falls back to a compact JSON rendering.
+  const salient = [
+    "command",
+    "file_path",
+    "path",
+    "pattern",
+    "query",
+    "message",
+    "prompt",
+  ];
+  const key = salient.find((k) => typeof args[k] === "string" && args[k]);
+  const value = key ? String(args[key]) : JSON.stringify(args);
+  const oneLine = (value ?? "").replace(/\s+/g, " ").trim();
+  return oneLine.length > 80 ? oneLine.slice(0, 79) + "…" : oneLine;
+}
+
+/** Markdown for one session entry, or "" when the entry carries nothing useful. */
+function renderEntry(entry: SessionEntry): string {
+  if (entry.type === "custom_message") {
+    // Extension-injected messages — including this extension's own
+    // `glean-response` answers — are part of the conversation the user sees.
+    const text = textOf((entry as { content?: unknown }).content);
+    if (!text.trim()) return "";
+    const customType = (entry as { customType?: string }).customType ?? "";
+    const heading = customType.startsWith("glean") ? "Glean" : "Note";
+    return `## ${heading}\n\n${text.trim()}`;
+  }
+
+  if (entry.type === "compaction" || entry.type === "branch_summary") {
+    const summary = (entry as { summary?: string }).summary ?? "";
+    return summary.trim()
+      ? `## Earlier context (summarized)\n\n${summary.trim()}`
+      : "";
+  }
+
+  if (entry.type !== "message") return "";
+  const msg = (entry as { message?: any }).message;
+  if (!msg) return "";
+
+  if (msg.role === "user") {
+    const text = textOf(msg.content).trim();
+    return text ? `## You\n\n${text}` : "";
+  }
+
+  if (msg.role === "assistant") {
+    const parts: string[] = [];
+    const text = textOf(msg.content).trim();
+    if (text) parts.push(text);
+    for (const c of Array.isArray(msg.content) ? msg.content : []) {
+      if (c?.type !== "toolCall") continue;
+      const args = summarizeToolArgs(c.arguments);
+      parts.push(`_[tool: ${c.name}${args ? ` — ${args}` : ""}]_`);
+    }
+    return parts.length ? `## Assistant\n\n${parts.join("\n\n")}` : "";
+  }
+
+  if (msg.role === "bashExecution") {
+    const command = String(msg.command ?? "").trim();
+    return command ? `## You\n\n_[shell: ${command}]_` : "";
+  }
+
+  // toolResult and everything else is dropped.
+  return "";
+}
+
+/**
+ * Render session entries as a markdown transcript.
+ *
+ * `entries` should be the current branch (`sessionManager.getBranch()`), in
+ * order. When the transcript exceeds `maxChars`, the OLDEST turns are dropped
+ * first — a hand-off cares about where the conversation ended up.
+ */
+export function buildTranscript(
+  entries: SessionEntry[],
+  opts?: { maxChars?: number },
+): { text: string; turns: number; truncated: boolean } {
+  const maxChars = opts?.maxChars ?? defaultTranscriptMaxChars();
+  const blocks: string[] = [];
+  for (const entry of entries) {
+    const block = renderEntry(entry);
+    if (block) blocks.push(block);
+  }
+
+  const SEP = "\n\n";
+  const OMITTED = "_[earlier turns omitted]_";
+  let kept = blocks;
+  let truncated = false;
+  const size = () =>
+    kept.reduce((n, b) => n + b.length, 0) +
+    Math.max(0, kept.length - 1) * SEP.length;
+
+  if (Number.isFinite(maxChars)) {
+    while (kept.length && size() > maxChars) {
+      kept = kept.slice(1);
+      truncated = true;
+    }
+  }
+
+  const body = kept.join(SEP);
+  return {
+    text: truncated ? `${OMITTED}${SEP}${body}` : body,
+    turns: kept.length,
+    truncated,
+  };
 }
 
 // ── Shared streaming core ─────────────────────────────────────────────────────
@@ -765,6 +949,12 @@ interface GleanStreamRequest {
   agentConfig: { agent: ReasoningMode };
   /** Continue an existing Glean conversation thread. */
   chatId?: string;
+  /**
+   * Persist the interaction as a Chat the user owns, making it readable and
+   * resumable on glean.com. Omitted (not sent as false) when not requested, so
+   * the wire format stays identical to previous releases by default.
+   */
+  saveChat?: boolean;
   signal?: AbortSignal | null;
 }
 
@@ -823,6 +1013,7 @@ async function* streamGleanChat(
       messages: req.messages,
       agentConfig: req.agentConfig,
       ...(req.chatId ? { chatId: req.chatId } : {}),
+      ...(req.saveChat ? { saveChat: true } : {}),
       stream: true,
     }),
     signal: req.signal ?? null,
@@ -1112,7 +1303,7 @@ export default function (pi: ExtensionAPI) {
     activeIsGlean = isGleanModel(ctx.model);
     if (ctx.model) footerModel = { id: ctx.model.id, provider: ctx.model.provider };
     _client = undefined;
-    state = { chatId: undefined };
+    state = { chatId: undefined, saved: undefined };
     for (const entry of ctx.sessionManager.getEntries()) {
       if (
         entry.type === "custom" &&
@@ -1236,7 +1427,10 @@ export default function (pi: ExtensionAPI) {
         };
       }
 
-      if (params.new_conversation) state.chatId = undefined;
+      if (params.new_conversation) {
+        state.chatId = undefined;
+        state.saved = false;
+      }
 
       // Streaming state. `answer` accumulates CONTENT text; `status` holds the
       // most recent UPDATE/HEADING line, shown until the answer starts.
@@ -1272,13 +1466,18 @@ export default function (pi: ExtensionAPI) {
           ],
           agentConfig: reasoningAgentConfig(params.reasoning),
           chatId: state.chatId,
+          saveChat: shouldSaveChat(),
           signal,
         })) {
           switch (event.type) {
             case "chat_id":
               if (event.chatId !== state.chatId) {
                 state.chatId = event.chatId;
-                pi.appendEntry(STATE_ENTRY_TYPE, { chatId: event.chatId });
+                state.saved = shouldSaveChat();
+                pi.appendEntry(STATE_ENTRY_TYPE, {
+                  chatId: event.chatId,
+                  saved: state.saved,
+                });
               }
               break;
             case "thinking":
@@ -1388,7 +1587,10 @@ export default function (pi: ExtensionAPI) {
         return;
       }
 
-      if (forceNew) state.chatId = undefined;
+      if (forceNew) {
+        state.chatId = undefined;
+        state.saved = false;
+      }
 
       ctx.ui.setStatus("glean", "Querying Glean...");
       try {
@@ -1397,6 +1599,7 @@ export default function (pi: ExtensionAPI) {
             messages: [{ author: "USER", fragments: [{ text: message }] }],
             agentConfig: reasoningAgentConfig(),
             ...(state.chatId ? { chatId: state.chatId } : {}),
+            ...(shouldSaveChat() ? { saveChat: true } : {}),
           },
           undefined, // locale
           undefined, // timezoneOffset
@@ -1404,7 +1607,11 @@ export default function (pi: ExtensionAPI) {
 
         if (response.chatId) {
           state.chatId = response.chatId;
-          pi.appendEntry(STATE_ENTRY_TYPE, { chatId: response.chatId });
+          state.saved = state.saved || shouldSaveChat();
+          pi.appendEntry(STATE_ENTRY_TYPE, {
+            chatId: response.chatId,
+            saved: state.saved,
+          });
         }
 
         const messages = response.messages ?? [];
@@ -1421,6 +1628,295 @@ export default function (pi: ExtensionAPI) {
             display: true,
           },
           { triggerTurn: false },
+        );
+      } catch (err: any) {
+        ctx.ui.notify(
+          `Glean error: ${(err?.message as string) ?? String(err)}`,
+          "error",
+        );
+      } finally {
+        ctx.ui.setStatus("glean", "");
+      }
+    },
+  });
+
+  // ── Hand-off: /glean-save, /glean-url, /glean-load ─────────────────────────
+  //
+  // Glean chats created through the API are transient unless `saveChat` is set:
+  // they have a chatId but no page on glean.com. These three commands make the
+  // round trip explicit — push the local session up as a saved chat, get its
+  // link, and pull a web chat back down into pi.
+
+  /**
+   * Copy a chat link to the clipboard; best-effort, never throws.
+   *
+   * Goes through `pi.exec` rather than pi's `copyToClipboard` helper to avoid
+   * importing the whole pi package for one string. Links are built from config
+   * plus an opaque `[A-Za-z0-9_-]` chat id, so single-quoting is sufficient.
+   */
+  async function copyLink(url: string): Promise<boolean> {
+    const copier =
+      process.platform === "darwin"
+        ? "pbcopy"
+        : "wl-copy 2>/dev/null || xclip -selection clipboard";
+    try {
+      const result = await pi.exec?.("sh", [
+        "-c",
+        `printf %s '${url.replace(/'/g, "")}' | ${copier}`,
+      ]);
+      return result?.code === 0;
+    } catch {
+      return false;
+    }
+  }
+
+  /** Record a chatId known to be persisted server-side. */
+  function adoptSavedChat(chatId: string): void {
+    state.chatId = chatId;
+    state.saved = true;
+    pi.appendEntry(STATE_ENTRY_TYPE, { chatId, saved: true });
+  }
+
+  pi.registerCommand("glean-save", {
+    description:
+      "Save this session's history to Glean for hand-off to glean.com. " +
+      "Usage: /glean-save [--new] [--full] [instructions]",
+    getArgumentCompletions: (prefix) =>
+      ["--new", "--full"]
+        .filter((f) => f.startsWith(prefix.trim()))
+        .map((f) => ({
+          value: f,
+          label: f,
+          description:
+            f === "--new"
+              ? "Start a fresh Glean chat instead of appending to the current thread"
+              : "Send the whole transcript, ignoring the size cap",
+        })),
+    handler: async (args, ctx) => {
+      let rest = args?.trim() ?? "";
+      let forceNew = false;
+      let full = false;
+      // Leading flags only, in any order; everything after them is the
+      // instruction. Matched on a word boundary so `--newish` is not `--new`.
+      for (;;) {
+        const flag = /^(--new|--full)(?:\s+|$)/.exec(rest);
+        if (!flag) break;
+        if (flag[1] === "--new") forceNew = true;
+        else full = true;
+        rest = rest.slice(flag[0].length).trim();
+      }
+
+      const token = await resolveTokenViaPi(ctx ?? piContext);
+      if (!token) {
+        ctx.ui.notify(
+          "No Glean credentials — run /login and select glean, or export GLEAN_API_TOKEN",
+          "error",
+        );
+        return;
+      }
+      const baseUrl = resolveGleanBaseUrl();
+      if (!baseUrl) {
+        ctx.ui.notify(
+          "No Glean backend URL. Set GLEAN_BACKEND_URL or GLEAN_INSTANCE.",
+          "error",
+        );
+        return;
+      }
+
+      const transcript = buildTranscript(ctx.sessionManager.getBranch(), {
+        ...(full ? { maxChars: Number.POSITIVE_INFINITY } : {}),
+      });
+      if (!transcript.turns) {
+        ctx.ui.notify("Nothing to save — this session has no history yet.", "info");
+        return;
+      }
+
+      if (forceNew) {
+        state.chatId = undefined;
+        state.saved = false;
+      }
+
+      // One USER message carrying the whole transcript: Glean answers once, and
+      // we do not depend on it persisting caller-supplied GLEAN_AI turns (which
+      // the API does not document).
+      const sessionName = ctx.sessionManager.getSessionName();
+      const header = [
+        "This is a transcript of a coding session I had with a local AI agent (pi).",
+        sessionName ? `Session: ${sessionName}` : "",
+        `Working directory: ${ctx.cwd}`,
+        transcript.truncated
+          ? "The oldest turns were dropped to fit; the transcript starts mid-conversation."
+          : "",
+      ]
+        .filter(Boolean)
+        .join("\n");
+      const instruction =
+        rest ||
+        "Summarize where we left off in a few lines, so I can continue this work here.";
+      const message = `${header}\n\n---\n\n${transcript.text}\n\n---\n\n${instruction}`;
+
+      ctx.ui.setStatus("glean", "Saving session to Glean...");
+      let answer = "";
+      const citations = new Map<string, string>();
+      try {
+        for await (const event of streamGleanChat({
+          token,
+          baseUrl,
+          messages: [
+            { author: "USER", messageType: "CONTENT", fragments: [{ text: message }] },
+          ],
+          agentConfig: reasoningAgentConfig(),
+          chatId: state.chatId,
+          saveChat: true,
+          signal: ctx.signal ?? null,
+        })) {
+          switch (event.type) {
+            case "chat_id":
+              adoptSavedChat(event.chatId);
+              break;
+            case "thinking":
+              ctx.ui.setStatus("glean", event.text.trim());
+              break;
+            case "content":
+              answer += event.text;
+              break;
+            case "citation":
+              if (!citations.has(event.url)) citations.set(event.url, event.title);
+              break;
+          }
+        }
+      } catch (err: any) {
+        ctx.ui.notify(
+          `Glean error: ${(err?.message as string) ?? String(err)}`,
+          "error",
+        );
+        return;
+      } finally {
+        ctx.ui.setStatus("glean", "");
+      }
+
+      if (!state.chatId) {
+        ctx.ui.notify(
+          "Glean did not return a chatId — the session was not saved.",
+          "error",
+        );
+        return;
+      }
+
+      const url = gleanChatUrl(state.chatId);
+      const copied = await copyLink(url);
+      const link = `**Saved to Glean:** ${url}`;
+      const note = transcript.truncated
+        ? `\n\n_${transcript.turns} turns sent; older ones were dropped to fit._`
+        : "";
+
+      pi.sendMessage(
+        {
+          customType: "glean-handoff",
+          content: `${link}${note}\n\n${answer + sourcesBlock(citations)}`,
+          display: true,
+        },
+        { triggerTurn: false },
+      );
+      ctx.ui.notify(
+        `Saved to Glean${copied ? " (link copied)" : ""}: ${url}`,
+        "info",
+      );
+    },
+  });
+
+  pi.registerCommand("glean-url", {
+    description: "Print (and copy) the glean.com link for the current Glean chat",
+    handler: async (_args, ctx) => {
+      if (!state.chatId) {
+        ctx.ui.notify(
+          "No Glean chat yet — run /glean-save, or ask something with /glean.",
+          "info",
+        );
+        return;
+      }
+      if (!state.saved) {
+        ctx.ui.notify(
+          `Chat ${state.chatId} was never saved server-side, so it has no page ` +
+            "on glean.com. Run /glean-save (or set GLEAN_SAVE_CHATS=1).",
+          "info",
+        );
+        return;
+      }
+      const url = gleanChatUrl(state.chatId);
+      const copied = await copyLink(url);
+      ctx.ui.notify(`${url}${copied ? " (copied)" : ""}`, "info");
+    },
+  });
+
+  pi.registerCommand("glean-load", {
+    description:
+      "Load a Glean chat into this session and continue it. " +
+      "Usage: /glean-load <chatId | glean.com chat URL>",
+    handler: async (args, ctx) => {
+      const chatId = parseChatId(args ?? "");
+      if (!chatId) {
+        ctx.ui.notify(
+          "Usage: /glean-load <chatId | https://…/chat/<chatId>>",
+          "info",
+        );
+        return;
+      }
+
+      const token = await resolveTokenViaPi(ctx ?? piContext);
+      if (!token) {
+        ctx.ui.notify(
+          "No Glean credentials — run /login and select glean, or export GLEAN_API_TOKEN",
+          "error",
+        );
+        return;
+      }
+
+      ctx.ui.setStatus("glean", "Loading Glean chat...");
+      try {
+        // GetChatResponse → { chatResult: { chat: { messages } } }.
+        const response = await getClient().client.chat.retrieve({ id: chatId });
+        const chat = response?.chatResult?.chat;
+        const messages: ChatMessage[] = chat?.messages ?? [];
+        if (!messages.length) {
+          ctx.ui.notify(
+            `Glean chat ${chatId} has no messages (or is not accessible).`,
+            "error",
+          );
+          return;
+        }
+
+        // Render both sides: extractAiText/formatCitations deliberately skip
+        // USER messages, so walk the array once here for the interleaved view.
+        const blocks: string[] = [];
+        for (const msg of messages) {
+          const text = (msg.fragments ?? []).map((f) => f.text ?? "").join("");
+          if (!text.trim()) continue;
+          if (msg.author === "USER") {
+            blocks.push(`## You (in Glean)\n\n${text.trim()}`);
+          } else if ((msg.messageType ?? "CONTENT") === "CONTENT") {
+            blocks.push(`## Glean\n\n${text.trim()}`);
+          }
+        }
+
+        const title = chat?.name ? `: ${chat.name}` : "";
+        pi.sendMessage(
+          {
+            customType: "glean-handoff",
+            content:
+              `**Loaded Glean chat${title}** (${gleanChatUrl(chatId)})\n\n` +
+              blocks.join("\n\n") +
+              formatCitations(messages),
+            display: true,
+          },
+          { triggerTurn: false },
+        );
+
+        // Adopt the thread so glean_chat and /glean continue this same chat.
+        adoptSavedChat(chatId);
+        ctx.ui.notify(
+          `Loaded Glean chat ${chatId} — /glean and glean_chat now continue it.`,
+          "info",
         );
       } catch (err: any) {
         ctx.ui.notify(

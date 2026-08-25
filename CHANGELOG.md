@@ -5,6 +5,41 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.6.0] - 2026-08-25
+
+### Added
+
+- **Chat hand-off between pi and glean.com.** Every request the extension made
+  was transient: Glean only persists a conversation when `saveChat` is set, so
+  nothing done from pi appeared in Glean's web chat history and the `chatId` the
+  extension threaded on could not be opened in a browser. Three commands close
+  the loop:
+  - `/glean-save [--new] [--full] [instructions]` renders the current session
+    branch as a markdown transcript and sends it as a single `USER` message with
+    `saveChat: true`, then injects Glean's recap and the chat link into the
+    session and copies the link to the clipboard. One message rather than a
+    replay of every turn: it costs one Glean answer, and the API does not
+    document whether caller-supplied `GLEAN_AI` turns are persisted.
+  - `/glean-url` prints and copies the link for the current chat, and says so
+    plainly when the thread was never saved instead of handing out a dead link.
+  - `/glean-load <chatId | URL>` pulls a Glean web chat into the session and
+    adopts its `chatId`, so `glean_chat` and `/glean` continue that thread.
+- The transcript keeps user and assistant prose, collapses tool calls to
+  one-line markers (`_[tool: bash — npm test]_`), and drops tool output,
+  thinking blocks, and the system prompt — Glean acts on prose, and a hand-off
+  needs to convey what was asked, answered, and touched, not replay the tools.
+  Over `GLEAN_TRANSCRIPT_MAX_CHARS` (default 60 000) the **oldest** turns are
+  dropped first, since a hand-off cares where the conversation ended up.
+- `GLEAN_SAVE_CHATS=1` makes the `glean_chat` tool and `/glean` persist their
+  chats too, so any thread started from pi is resumable on the web. Off by
+  default: otherwise every question the LLM asks mid-task lands in the user's
+  Glean chat history.
+- Chat links point at `https://app.glean.com/chat/<chatId>`; the web app is
+  served from that one host, not a per-tenant one (a host derived from the
+  backend URL, `https://<instance>.glean.com`, does not reach the chat page).
+  Glean's API exposes no link for a Chat, so this is a convention rather than a
+  contract — `GLEAN_WEB_URL` (env or `auth.json`) overrides it.
+
 ## [1.5.0] - 2026-08-17
 
 ### Added

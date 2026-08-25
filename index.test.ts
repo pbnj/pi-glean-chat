@@ -19,7 +19,14 @@ import { after, afterEach, before, beforeEach, describe, it } from "node:test";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { resolveGleanBaseUrl, resolveGleanToken } from "./index.ts";
+import {
+  buildTranscript,
+  gleanChatUrl,
+  parseChatId,
+  resolveGleanBaseUrl,
+  resolveGleanToken,
+  resolveGleanWebUrl,
+} from "./index.ts";
 
 // ── Test doubles ──────────────────────────────────────────────────────────────
 
@@ -80,8 +87,34 @@ function makeCommandCtx(overrides: Record<string, any> = {}) {
     cwd: "/tmp/project",
     model: { id: "glean-assistant", provider: "glean" },
     ui,
+    // Hand-off commands read the session branch and its name.
+    sessionManager: {
+      getBranch: () => [],
+      getSessionName: () => undefined,
+    },
+    signal: undefined,
     getFooter: () => footerFactory,
     ...overrides,
+  } as any;
+}
+
+/** Session entry doubles for the transcript builder. */
+function msgEntry(message: any, id = "e1") {
+  return { type: "message", id, parentId: null, timestamp: "", message } as any;
+}
+function customMessageEntry(
+  customType: string,
+  content: string,
+  id = "c1",
+) {
+  return {
+    type: "custom_message",
+    id,
+    parentId: null,
+    timestamp: "",
+    customType,
+    content,
+    display: true,
   } as any;
 }
 
@@ -966,6 +999,382 @@ describe("tool streaming", () => {
   });
 });
 
+// ── Transcript building ───────────────────────────────────────────────────────
+
+describe("buildTranscript", () => {
+  it("renders user and assistant turns in order", () => {
+    const { text, turns } = buildTranscript([
+      msgEntry({ role: "user", content: "how do I deploy?", timestamp: 0 }, "a"),
+      msgEntry(
+        {
+          role: "assistant",
+          content: [{ type: "text", text: "run make deploy" }],
+          timestamp: 0,
+        },
+        "b",
+      ),
+    ]);
+    assert.equal(turns, 2);
+    assert.equal(
+      text,
+      "## You\n\nhow do I deploy?\n\n## Assistant\n\nrun make deploy",
+    );
+  });
+
+  it("collapses tool calls to one-line markers and drops tool results", () => {
+    const { text } = buildTranscript([
+      msgEntry(
+        {
+          role: "assistant",
+          content: [
+            { type: "text", text: "checking" },
+            { type: "thinking", thinking: "SECRET THINKING" },
+            {
+              type: "toolCall",
+              id: "t1",
+              name: "bash",
+              arguments: { command: "npm test\n--verbose" },
+            },
+          ],
+          timestamp: 0,
+        },
+        "a",
+      ),
+      msgEntry(
+        {
+          role: "toolResult",
+          toolCallId: "t1",
+          toolName: "bash",
+          content: [{ type: "text", text: "TOOL OUTPUT" }],
+          isError: false,
+          timestamp: 0,
+        },
+        "b",
+      ),
+    ]);
+    assert.match(text, /_\[tool: bash — npm test --verbose\]_/);
+    assert.ok(!text.includes("TOOL OUTPUT"));
+    assert.ok(!text.includes("SECRET THINKING"));
+  });
+
+  it("truncates long tool arguments to a single line", () => {
+    const { text } = buildTranscript([
+      msgEntry(
+        {
+          role: "assistant",
+          content: [
+            {
+              type: "toolCall",
+              id: "t1",
+              name: "read",
+              arguments: { file_path: "x".repeat(200) },
+            },
+          ],
+          timestamp: 0,
+        },
+        "a",
+      ),
+    ]);
+    const marker = /_\[tool: read — (.+)\]_/.exec(text)![1];
+    assert.equal(marker.length, 80);
+    assert.ok(marker.endsWith("…"));
+  });
+
+  it("includes extension-injected messages and summaries", () => {
+    const { text } = buildTranscript([
+      {
+        type: "compaction",
+        id: "z",
+        parentId: null,
+        timestamp: "",
+        summary: "we set up auth",
+        firstKeptEntryId: "a",
+        tokensBefore: 1,
+      } as any,
+      customMessageEntry("glean-response", "**Glean answer:** use SSO"),
+    ]);
+    assert.match(text, /## Earlier context \(summarized\)\n\nwe set up auth/);
+    assert.match(text, /## Glean\n\n\*\*Glean answer:\*\* use SSO/);
+  });
+
+  it("drops the oldest turns first when over the cap", () => {
+    const entries = ["first", "second", "third"].map((t, i) =>
+      msgEntry({ role: "user", content: t, timestamp: 0 }, `e${i}`),
+    );
+    const { text, turns, truncated } = buildTranscript(entries, {
+      maxChars: 40,
+    });
+    assert.equal(truncated, true);
+    assert.ok(!text.includes("first"));
+    assert.ok(text.includes("second"));
+    assert.ok(text.includes("third"));
+    assert.equal(turns, 2);
+    assert.match(text, /^_\[earlier turns omitted\]_/);
+  });
+
+  it("reports nothing to save for an empty branch", () => {
+    assert.deepEqual(buildTranscript([]), {
+      text: "",
+      turns: 0,
+      truncated: false,
+    });
+  });
+});
+
+// ── Hand-off commands ─────────────────────────────────────────────────────────
+
+describe("hand-off", () => {
+  const branch = [
+    msgEntry({ role: "user", content: "how do I deploy?", timestamp: 0 }, "a"),
+    msgEntry(
+      {
+        role: "assistant",
+        content: [{ type: "text", text: "run make deploy" }],
+        timestamp: 0,
+      },
+      "b",
+    ),
+  ];
+
+  function handoffCtx(overrides: Record<string, any> = {}) {
+    return makeCommandCtx({
+      sessionManager: {
+        getBranch: () => branch,
+        getSessionName: () => "deploy work",
+      },
+      ...overrides,
+    });
+  }
+
+  /** Respond with a chatId + a one-line answer. */
+  function savedResponder(chatId: string) {
+    return ({ res }: { body: any; res: import("node:http").ServerResponse }) => {
+      res.writeHead(200, { "Content-Type": "text/plain" });
+      res.write(
+        JSON.stringify({
+          chatId,
+          ...gleanMsg("c1", "CONTENT", "You were deploying."),
+        }) + "\n",
+      );
+      res.end();
+    };
+  }
+
+  let sentMessages: any[];
+  beforeEach(() => {
+    sentMessages = [];
+    piStub.sendMessage = (msg: any) => sentMessages.push(msg);
+  });
+  afterEach(() => {
+    piStub.sendMessage = () => {};
+  });
+
+  it("registers the hand-off commands", () => {
+    for (const name of ["glean-save", "glean-url", "glean-load"])
+      assert.equal(typeof captured.commands[name]?.handler, "function");
+  });
+
+  it("/glean-save sends the transcript once with saveChat and reports the URL", async () => {
+    respond = savedResponder("chat-saved-1");
+    const ctx = handoffCtx();
+    await captured.commands["glean-save"].handler("--new", ctx);
+
+    assert.equal(lastRequestBody.saveChat, true);
+    assert.equal(lastRequestBody.chatId, undefined);
+    assert.equal(lastRequestBody.messages.length, 1);
+    const sent = lastRequestBody.messages[0];
+    assert.equal(sent.author, "USER");
+    const text = sent.fragments.map((f: any) => f.text).join("");
+    assert.match(text, /## You\n\nhow do I deploy\?/);
+    assert.match(text, /## Assistant\n\nrun make deploy/);
+    assert.match(text, /Session: deploy work/);
+    assert.match(text, /Summarize where we left off/);
+
+    // The link and Glean's recap are injected into the session.
+    assert.equal(sentMessages.length, 1);
+    assert.equal(sentMessages[0].customType, "glean-handoff");
+    assert.match(sentMessages[0].content, /\*\*Saved to Glean:\*\*/);
+    assert.match(sentMessages[0].content, /chat\/chat-saved-1/);
+    assert.match(sentMessages[0].content, /You were deploying\./);
+    assert.ok(
+      captured.entries.some(
+        (e) => e.chatId === "chat-saved-1" && e.saved === true,
+      ),
+    );
+  });
+
+  it("/glean-save appends to the current thread unless --new", async () => {
+    respond = savedResponder("chat-saved-1");
+    await captured.commands["glean-save"].handler("", handoffCtx());
+    assert.equal(lastRequestBody.chatId, "chat-saved-1");
+  });
+
+  it("/glean-save uses trailing text as the instruction", async () => {
+    respond = savedResponder("chat-saved-1");
+    await captured.commands["glean-save"].handler(
+      "--new what did I miss?",
+      handoffCtx(),
+    );
+    const text = lastRequestBody.messages[0].fragments
+      .map((f: any) => f.text)
+      .join("");
+    assert.match(text, /what did I miss\?$/);
+    assert.ok(!text.includes("Summarize where we left off"));
+  });
+
+  it("/glean-save refuses an empty session", async () => {
+    const ctx = handoffCtx({
+      sessionManager: { getBranch: () => [], getSessionName: () => undefined },
+    });
+    await captured.commands["glean-save"].handler("--new", ctx);
+    assert.equal(lastRequestBody, undefined);
+    assert.match(ctx.notes.at(-1).message, /Nothing to save/);
+  });
+
+  it("/glean-url reports the link only for a saved chat", async () => {
+    // Fresh transient thread: the tool threads a chatId but never saved it.
+    respond = savedResponder("chat-transient");
+    await captured.tool.execute(
+      "call-x",
+      { message: "q", new_conversation: true },
+      undefined,
+      undefined,
+      undefined,
+    );
+    const transient = handoffCtx();
+    await captured.commands["glean-url"].handler("", transient);
+    assert.match(transient.notes.at(-1).message, /never saved/);
+
+    // After /glean-save the same command yields a link.
+    respond = savedResponder("chat-saved-2");
+    await captured.commands["glean-save"].handler("--new", handoffCtx());
+    const saved = handoffCtx();
+    await captured.commands["glean-url"].handler("", saved);
+    assert.match(saved.notes.at(-1).message, /\/chat\/chat-saved-2/);
+  });
+
+  it("/glean-load pulls a web chat in and adopts its thread", async () => {
+    respond = ({ res }) => {
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(
+        JSON.stringify({
+          chatResult: {
+            chat: {
+              id: "web-chat-9",
+              name: "Deploy questions",
+              messages: [
+                {
+                  author: "USER",
+                  messageType: "CONTENT",
+                  fragments: [{ text: "what about staging?" }],
+                },
+                {
+                  author: "GLEAN_AI",
+                  messageType: "CONTENT",
+                  fragments: [
+                    {
+                      text: "staging deploys from main",
+                      citation: {
+                        sourceDocument: {
+                          title: "Runbook",
+                          url: "https://w/rb",
+                        },
+                      },
+                    },
+                  ],
+                },
+              ],
+            },
+          },
+        }),
+      );
+    };
+    const ctx = handoffCtx();
+    await captured.commands["glean-load"].handler(
+      "https://acme.glean.com/chat/web-chat-9",
+      ctx,
+    );
+
+    assert.equal(lastRequestBody.id, "web-chat-9");
+    assert.equal(sentMessages.length, 1);
+    const content = sentMessages[0].content;
+    assert.match(content, /Loaded Glean chat: Deploy questions/);
+    assert.match(content, /## You \(in Glean\)\n\nwhat about staging\?/);
+    assert.match(content, /## Glean\n\nstaging deploys from main/);
+    assert.match(content, /\[Runbook\]\(https:\/\/w\/rb\)/);
+    assert.ok(
+      captured.entries.some(
+        (e) => e.chatId === "web-chat-9" && e.saved === true,
+      ),
+    );
+
+    // Follow-up tool calls continue the loaded chat.
+    respond = savedResponder("web-chat-9");
+    await captured.tool.execute(
+      "call-y",
+      { message: "follow up" },
+      undefined,
+      undefined,
+      undefined,
+    );
+    assert.equal(lastRequestBody.chatId, "web-chat-9");
+  });
+
+  it("/glean-load rejects input with no chat id", async () => {
+    const ctx = handoffCtx();
+    await captured.commands["glean-load"].handler("  ", ctx);
+    assert.match(ctx.notes.at(-1).message, /Usage: \/glean-load/);
+  });
+
+  it("parses chat ids from bare ids and URLs", () => {
+    assert.equal(parseChatId("abc123"), "abc123");
+    assert.equal(parseChatId("https://acme.glean.com/chat/abc123"), "abc123");
+    assert.equal(
+      parseChatId("https://acme.glean.com/chat/agents/abc123?x=1"),
+      "abc123",
+    );
+    assert.equal(parseChatId("not a chat id"), undefined);
+    assert.equal(parseChatId(""), undefined);
+  });
+});
+
+// ── saveChat opt-in ───────────────────────────────────────────────────────────
+
+describe("GLEAN_SAVE_CHATS", () => {
+  afterEach(() => {
+    delete process.env.GLEAN_SAVE_CHATS;
+  });
+
+  async function askTool() {
+    respond = ndjsonResponder([
+      { chatId: "chat-optin", ...gleanMsg("c1", "CONTENT", "a") },
+    ]);
+    await captured.tool.execute(
+      "call-z",
+      { message: "q", new_conversation: true },
+      undefined,
+      undefined,
+      undefined,
+    );
+  }
+
+  it("omits saveChat by default", async () => {
+    await askTool();
+    assert.equal(lastRequestBody.saveChat, undefined);
+  });
+
+  it("sets saveChat when enabled", async () => {
+    process.env.GLEAN_SAVE_CHATS = "1";
+    await askTool();
+    assert.equal(lastRequestBody.saveChat, true);
+    assert.ok(
+      captured.entries.some(
+        (e) => e.chatId === "chat-optin" && e.saved === true,
+      ),
+    );
+  });
+});
+
 // ── OAuth ─────────────────────────────────────────────────────────────────────
 
 describe("oauth", () => {
@@ -1063,6 +1472,7 @@ describe("configuration resolution", () => {
     "GLEAN_BACKEND_URL",
     "GLEAN_INSTANCE",
     "GLEAN_API_TOKEN",
+    "GLEAN_WEB_URL",
     "HOME",
   ] as const;
   let saved: Record<string, string | undefined>;
@@ -1134,6 +1544,25 @@ describe("configuration resolution", () => {
     assert.equal(resolveGleanBaseUrl(), "https://acme-be.glean.com");
     process.env.GLEAN_BACKEND_URL = "https://acme-be.glean.com///";
     assert.equal(resolveGleanBaseUrl(), "https://acme-be.glean.com");
+  });
+
+  it("defaults chat links to app.glean.com regardless of the backend host", () => {
+    // The UI is served from one host; a tenant-derived https://acme.glean.com
+    // does not resolve to the chat page.
+    process.env.GLEAN_BACKEND_URL = "https://acme-be.glean.com";
+    assert.equal(resolveGleanWebUrl(), "https://app.glean.com");
+    assert.equal(gleanChatUrl("c1"), "https://app.glean.com/chat/c1");
+  });
+
+  it("prefers GLEAN_WEB_URL, then auth.json, over the default", () => {
+    writeAuth({
+      type: "api_key",
+      key: "k",
+      env: { GLEAN_WEB_URL: "https://from-file.glean.com/" },
+    });
+    assert.equal(resolveGleanWebUrl(), "https://from-file.glean.com");
+    process.env.GLEAN_WEB_URL = "https://from-env.glean.com//";
+    assert.equal(resolveGleanWebUrl(), "https://from-env.glean.com");
   });
 
   it("reads the file fresh each call, so /login and OAuth refresh are picked up", () => {
