@@ -1,0 +1,39 @@
+# Release pipeline: conventional commits → semver bump + CHANGELOG + tag.
+#
+# On every push to main, release-please maintains a "chore(main): release x.y.z"
+# pull request that accumulates the Conventional Commit subjects landed since the
+# last release, rewrites CHANGELOG.md and package.json, and computes the next
+# version (fix → patch, feat → minor, `!`/BREAKING CHANGE → major). Merging that
+# PR is the act of releasing: the action then tags `vX.Y.Z` and publishes a
+# GitHub release with the same notes.
+#
+# Nothing is published to npm — this package is installed by git clone
+# (`pi install git:github.com/pbnj/pi-glean-chat`), so the tag and the version in
+# package.json are the whole artifact.
+name: release
+
+on:
+  push:
+    branches: [main]
+
+# Only one release PR should be in flight; a second push while the first run is
+# still open would race on the same branch.
+concurrency:
+  group: release-please
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  release-please:
+    runs-on: ubuntu-latest
+    steps:
+      # The default GITHUB_TOKEN is enough here. Its pushes deliberately do not
+      # trigger other workflows, so if a CI workflow is ever added and needs to
+      # run on the release PR, swap in a PAT via `token:`.
+      - uses: googleapis/release-please-action@v4
+        with:
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json
