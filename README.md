@@ -126,6 +126,12 @@ first and the message says so. Glean's reply — by default a recap of where you
 left off — plus the chat link are injected into the session, and the link is
 copied to the clipboard.
 
+Saving a long session takes a while, so `/glean-save` shows an animated progress
+line above the editor with Glean's current phase and the elapsed time — e.g.
+`⠹ Saving session to Glean · searching Confluence (9s)`. `/glean` and
+`/glean-load` show the same indicator while they run. The line is also mirrored
+into the footer status area, so it shows up in RPC/print modes too.
+
 `/glean-load` accepts a bare chat id or any `…/chat/<id>` URL, injects the web
 conversation into the local session, and adopts its `chatId`, so subsequent
 `glean_chat` / `/glean` calls continue that same Glean chat.
@@ -166,8 +172,9 @@ While the `glean / Glean Assistant` model is selected, the footer is replaced
 with a compact Glean footer whose model line reads
 `(glean) glean-assistant • <mode>`, mirroring the built-in
 `model • thinking-level` indicator. Glean's API exposes no token/context/cost
-data, so those stats are omitted. Switching to any other model restores pi's
-built-in footer.
+data, so those stats are omitted. Extension status text still gets its own line,
+as in the built-in footer. Switching to any other model restores pi's built-in
+footer.
 
 ### Model: `glean / Glean Assistant`
 

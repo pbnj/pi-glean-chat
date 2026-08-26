@@ -21,6 +21,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   buildTranscript,
+  formatProgressLine,
   gleanChatUrl,
   parseChatId,
   resolveGleanBaseUrl,
@@ -70,11 +71,19 @@ async function fireEvent(event: string, payload: any, ctx: any) {
 function makeCommandCtx(overrides: Record<string, any> = {}) {
   const notes: { message: string; level: string }[] = [];
   const statuses: Record<string, string | undefined> = {};
+  const widgets: Record<string, string[] | undefined> = {};
+  // Every setWidget call in order, so tests can assert the progress widget was
+  // shown *and* torn down rather than only inspecting the final state.
+  const widgetCalls: { key: string; content: string[] | undefined }[] = [];
   let footerFactory: any = null;
   const ui = {
     notify: (message: string, level: string) => notes.push({ message, level }),
     setStatus: (key: string, text: string | undefined) => {
       statuses[key] = text;
+    },
+    setWidget: (key: string, content: string[] | undefined) => {
+      widgets[key] = content;
+      widgetCalls.push({ key, content });
     },
     setFooter: (factory: any) => {
       footerFactory = factory;
@@ -83,6 +92,8 @@ function makeCommandCtx(overrides: Record<string, any> = {}) {
   return {
     notes,
     statuses,
+    widgets,
+    widgetCalls,
     mode: "tui",
     cwd: "/tmp/project",
     model: { id: "glean-assistant", provider: "glean" },
@@ -119,12 +130,17 @@ function customMessageEntry(
 }
 
 /** Fake theme + footerData for rendering a captured footer factory. */
-function renderFooter(factory: any, providerCount = 2, branch: string | null = null) {
+function renderFooter(
+  factory: any,
+  providerCount = 2,
+  branch: string | null = null,
+  extensionStatuses: Map<string, string> = new Map(),
+) {
   const theme = { fg: (_c: string, t: string) => t, bold: (t: string) => t };
   const footerData = {
     getGitBranch: () => branch,
     getAvailableProviderCount: () => providerCount,
-    getExtensionStatuses: () => new Map(),
+    getExtensionStatuses: () => extensionStatuses,
     onBranchChange: () => () => {},
   };
   const component = factory({}, theme, footerData);
@@ -537,6 +553,31 @@ describe("reasoning mode", () => {
     assert.ok(renderFooter(ctx.getFooter())[1].includes("\u2022 auto"));
     await captured.commands["glean-mode"].handler("advanced", ctx);
     assert.ok(renderFooter(ctx.getFooter())[1].includes("\u2022 advanced"));
+  });
+
+  it("renders extension statuses as a third line", async () => {
+    const ctx = makeCommandCtx();
+    await fireEvent(
+      "model_select",
+      { model: { id: "glean-assistant", provider: "glean" } },
+      ctx,
+    );
+
+    // No statuses: the footer stays two lines, as before.
+    assert.equal(renderFooter(ctx.getFooter()).length, 2);
+
+    // With statuses: sorted by key, joined, collapsed to one line.
+    const lines = renderFooter(
+      ctx.getFooter(),
+      2,
+      null,
+      new Map([
+        ["z-other", "second"],
+        ["glean-progress", "⠻ Saving session to Glean\n(3s)"],
+      ]),
+    );
+    assert.equal(lines.length, 3);
+    assert.equal(lines[2], "⠻ Saving session to Glean (3s) second");
   });
 
   it("restores the built-in footer when switching away from Glean", async () => {
@@ -1001,6 +1042,35 @@ describe("tool streaming", () => {
 
 // ── Transcript building ───────────────────────────────────────────────────────
 
+describe("formatProgressLine", () => {
+  it("renders spinner, label and elapsed seconds", () => {
+    assert.equal(
+      formatProgressLine("Saving session to Glean", "", 9_400, "⠹"),
+      "⠹ Saving session to Glean (9s)",
+    );
+  });
+
+  it("appends the live phase text when present", () => {
+    assert.equal(
+      formatProgressLine("Saving to Glean", "searching Confluence", 0, "⠋"),
+      "⠋ Saving to Glean · searching Confluence (0s)",
+    );
+  });
+
+  it("collapses multi-line phase text to a single line", () => {
+    assert.equal(
+      formatProgressLine("Saving", "  reading\n\n12 documents  ", 1_000, "⠙"),
+      "⠙ Saving · reading 12 documents (1s)",
+    );
+  });
+
+  it("truncates to the given width", () => {
+    const line = formatProgressLine("Saving", "x".repeat(200), 0, "⠋", 20);
+    assert.equal(line.length, 20);
+    assert.ok(line.endsWith("…"));
+  });
+});
+
 describe("buildTranscript", () => {
   it("renders user and assistant turns in order", () => {
     const { text, turns } = buildTranscript([
@@ -1318,6 +1388,119 @@ describe("hand-off", () => {
       undefined,
     );
     assert.equal(lastRequestBody.chatId, "web-chat-9");
+  });
+
+  describe("progress indicator", () => {
+    /** Content of the last non-clearing progress widget update, if any. */
+    function lastProgressLine(ctx: any): string | undefined {
+      const shown = ctx.widgetCalls.filter(
+        (c: any) => c.key === "glean-progress" && c.content !== undefined,
+      );
+      return shown.at(-1)?.content[0];
+    }
+
+    it("/glean-save shows a progress widget and clears it when done", async () => {
+      respond = ({ res }) => {
+        res.writeHead(200, { "Content-Type": "text/plain" });
+        res.write(
+          JSON.stringify({
+            chatId: "chat-progress-1",
+            ...gleanMsg("u1", "UPDATE", "searching Confluence"),
+          }) + "\n",
+        );
+        res.write(
+          JSON.stringify(gleanMsg("c1", "CONTENT", "You were deploying.")) +
+            "\n",
+        );
+        res.end();
+      };
+      const ctx = handoffCtx();
+      await captured.commands["glean-save"].handler("--new", ctx);
+
+      const forWidget = ctx.widgetCalls.filter(
+        (c: any) => c.key === "glean-progress",
+      );
+      assert.ok(forWidget.length > 1, "progress widget was never rendered");
+      assert.ok(
+        forWidget.some((c: any) =>
+          c.content?.[0]?.includes("Saving session to Glean"),
+        ),
+      );
+      // Glean's own phase text reaches the line.
+      assert.ok(
+        forWidget.some((c: any) =>
+          c.content?.[0]?.includes("searching Confluence"),
+        ),
+      );
+      // ...and it is torn down afterwards, in both surfaces.
+      assert.equal(forWidget.at(-1).content, undefined);
+      assert.equal(ctx.widgets["glean-progress"], undefined);
+      assert.equal(ctx.statuses["glean-progress"], "");
+    });
+
+    it("/glean-save clears the progress widget on error", async () => {
+      respond = ({ res }) => {
+        res.writeHead(500, { "Content-Type": "text/plain" });
+        res.end("boom");
+      };
+      const ctx = handoffCtx();
+      await captured.commands["glean-save"].handler("--new", ctx);
+
+      assert.match(ctx.notes.at(-1).message, /Glean error/);
+      assert.equal(ctx.widgets["glean-progress"], undefined);
+      assert.equal(ctx.statuses["glean-progress"], "");
+    });
+
+    it("/glean-load shows and clears its own progress line", async () => {
+      respond = ({ res }) => {
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(
+          JSON.stringify({
+            chatResult: {
+              chat: {
+                id: "web-chat-p",
+                messages: [
+                  {
+                    author: "GLEAN_AI",
+                    messageType: "CONTENT",
+                    fragments: [{ text: "hi" }],
+                  },
+                ],
+              },
+            },
+          }),
+        );
+      };
+      const ctx = handoffCtx();
+      await captured.commands["glean-load"].handler("web-chat-p", ctx);
+
+      assert.match(lastProgressLine(ctx) ?? "", /Loading Glean chat/);
+      assert.equal(ctx.widgets["glean-progress"], undefined);
+    });
+
+    it("/glean shows and clears its own progress line", async () => {
+      // /glean goes through the SDK (non-streaming), so answer with plain JSON.
+      respond = ({ res }) => {
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(
+          JSON.stringify({
+            chatId: "chat-progress-2",
+            messages: [
+              {
+                author: "GLEAN_AI",
+                messageType: "CONTENT",
+                fragments: [{ text: "an answer" }],
+              },
+            ],
+          }),
+        );
+      };
+      const ctx = handoffCtx();
+      await captured.commands["glean"].handler("what is up?", ctx);
+
+      assert.match(lastProgressLine(ctx) ?? "", /Querying Glean/);
+      assert.equal(ctx.widgets["glean-progress"], undefined);
+    });
   });
 
   it("/glean-load rejects input with no chat id", async () => {
