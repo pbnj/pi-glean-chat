@@ -1,0 +1,43 @@
+# Test pipeline: `node --test` over index.test.ts.
+#
+# There is no build step — the suite imports index.ts directly and relies on
+# Node's native type stripping (Node >= 23.6), so the matrix starts at 24 (the
+# oldest LTS that supports it; Node 20 is already deprecated on the runners).
+#
+# The peer dependencies (@earendil-works/pi-ai, pi-tui, typebox) are what the
+# tests actually import, and they are pinned in package-lock.json — hence
+# `npm ci` rather than `npm install`.
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# A new push to a PR makes the in-flight run redundant.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node-version: [24, 26]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+          cache: npm
+
+      - run: npm ci
+
+      - run: npm test
