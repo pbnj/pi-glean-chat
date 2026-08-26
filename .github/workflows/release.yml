@@ -12,9 +12,14 @@
 # package.json are the whole artifact.
 name: release
 
+# `workflow_dispatch` is the recovery hatch: a push to main occasionally fails to
+# reach Actions (no run is created at all), which strands the release PR until
+# the next commit lands. Re-run it by hand instead — release-please is
+# idempotent, so a dispatch with nothing new to release is a no-op.
 on:
   push:
     branches: [main]
+  workflow_dispatch:
 
 # Only one release PR should be in flight; a second push while the first run is
 # still open would race on the same branch.
