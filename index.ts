@@ -254,6 +254,17 @@ let footerCwd = process.cwd();
 // not re-exported from the package root).
 type FooterComponent = { render(width: number): string[]; dispose?(): void };
 
+/**
+ * The slice of pi's ReadonlyFooterDataProvider the custom footer reads. Spelled
+ * structurally because the concrete type is not re-exported from the package
+ * root; `getExtensionStatuses` is what `ctx.ui.setStatus()` writes into.
+ */
+type FooterData = {
+  getGitBranch(): string | null;
+  getAvailableProviderCount(): number;
+  getExtensionStatuses?(): ReadonlyMap<string, string>;
+};
+
 /** True when a model belongs to the Glean provider. */
 function isGleanModel(model: { provider?: string } | undefined): boolean {
   return model?.provider === "glean";
@@ -285,13 +296,14 @@ function formatCwd(cwd: string): string {
  * `(provider) model • <reasoning>` line, mirroring pi's built-in footer layout
  * minus the token/context stats Glean does not provide. Reads the reasoning mode
  * live, so /glean-mode changes are reflected on the next render.
+ *
+ * Extension statuses (`ctx.ui.setStatus()`) get a third line, as in pi's
+ * built-in footer — without it, replacing the footer would silently swallow
+ * every status this extension reports while a command is running.
  */
 function makeGleanFooter(
   theme: { fg(color: string, text: string): string },
-  footerData: {
-    getGitBranch(): string | null;
-    getAvailableProviderCount(): number;
-  },
+  footerData: FooterData,
 ): FooterComponent {
   return {
     render(width: number): string[] {
@@ -311,7 +323,21 @@ function makeGleanFooter(
       const pad = " ".repeat(Math.max(0, width - visibleWidth(right)));
       const modelLine = theme.fg("dim", pad + right);
 
-      return [pwdLine, modelLine];
+      const lines = [pwdLine, modelLine];
+
+      // Extension statuses, sorted by key so the order is stable across renders.
+      const statuses = footerData.getExtensionStatuses?.() ?? new Map();
+      if (statuses.size) {
+        const statusLine = [...statuses.entries()]
+          .sort(([a], [b]) => a.localeCompare(b))
+          .map(([, text]) => text.replace(/\s+/g, " ").trim())
+          .filter(Boolean)
+          .join(" ");
+        if (statusLine)
+          lines.push(theme.fg("dim", truncatePlain(statusLine, width)));
+      }
+
+      return lines;
     },
   };
 }
@@ -328,13 +354,104 @@ function applyGleanFooter(
   if (mode && mode !== "tui") return;
   if (activeIsGlean) {
     ui.setFooter((_tui, theme, footerData) =>
-      makeGleanFooter(theme as any, footerData as any),
+      makeGleanFooter(theme as any, footerData as FooterData),
     );
     gleanFooterActive = true;
   } else if (gleanFooterActive) {
     ui.setFooter(undefined); // restore built-in footer
     gleanFooterActive = false;
   }
+}
+
+// ── Progress indicator ────────────────────────────────────────────────────────
+//
+// The /glean* commands are synchronous from the user's point of view: nothing
+// reaches the conversation until the whole answer has streamed, which on a big
+// transcript with ADVANCED reasoning is tens of seconds of silence. A spinner
+// above the editor — carrying Glean's own progress lines and an elapsed counter
+// — is the only signal that the command is alive.
+
+const PROGRESS_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+const PROGRESS_TICK_MS = 100;
+const PROGRESS_WIDGET_KEY = "glean-progress";
+const PROGRESS_DEFAULT_WIDTH = 80;
+
+/**
+ * One line of progress: `⠹ Saving to Glean · searching Confluence (9s)`.
+ *
+ * Pure, so it can be tested without a TUI. `status` is Glean's live phase text,
+ * which arrives as arbitrary multi-line markdown — it is collapsed to one line
+ * and the whole line is truncated to `width`.
+ */
+export function formatProgressLine(
+  label: string,
+  status: string,
+  elapsedMs: number,
+  frame: string,
+  width = PROGRESS_DEFAULT_WIDTH,
+): string {
+  const phase = status.replace(/\s+/g, " ").trim();
+  const elapsed = `(${Math.floor(Math.max(0, elapsedMs) / 1000)}s)`;
+  const line = [frame, label, phase ? `· ${phase}` : "", elapsed]
+    .filter(Boolean)
+    .join(" ");
+  return truncatePlain(line, width);
+}
+
+interface Progress {
+  /** Replace the phase text shown after the label. */
+  status(text: string): void;
+  /** Stop animating and clear the widget/status. Idempotent. */
+  stop(): void;
+}
+
+/**
+ * Start an animated progress line for a long-running command.
+ *
+ * Renders into a widget above the editor (interactive mode) *and* mirrors the
+ * text through `setStatus`, so RPC/print modes and pi's built-in footer still
+ * report something. `setWidget` is optional-called: not every mode provides it.
+ */
+function startProgress(
+  ui: Pick<ExtensionUIContext, "setStatus"> &
+    Partial<Pick<ExtensionUIContext, "setWidget">>,
+  label: string,
+): Progress {
+  const started = Date.now();
+  let phase = "";
+  let tick = 0;
+  let stopped = false;
+
+  const paint = () => {
+    const line = formatProgressLine(
+      label,
+      phase,
+      Date.now() - started,
+      PROGRESS_FRAMES[tick++ % PROGRESS_FRAMES.length],
+    );
+    ui.setWidget?.(PROGRESS_WIDGET_KEY, [line]);
+    ui.setStatus(PROGRESS_WIDGET_KEY, line);
+  };
+
+  paint();
+  const timer = setInterval(paint, PROGRESS_TICK_MS);
+  // Never let a pending repaint keep the process alive.
+  (timer as { unref?: () => void }).unref?.();
+
+  return {
+    status(text: string) {
+      if (stopped) return;
+      phase = text;
+      paint();
+    },
+    stop() {
+      if (stopped) return;
+      stopped = true;
+      clearInterval(timer);
+      ui.setWidget?.(PROGRESS_WIDGET_KEY, undefined);
+      ui.setStatus(PROGRESS_WIDGET_KEY, "");
+    },
+  };
 }
 
 // ── Response helpers ──────────────────────────────────────────────────────────
@@ -1592,7 +1709,7 @@ export default function (pi: ExtensionAPI) {
         state.saved = false;
       }
 
-      ctx.ui.setStatus("glean", "Querying Glean...");
+      const progress = startProgress(ctx.ui, "Querying Glean");
       try {
         const response = await getClient().client.chat.create(
           {
@@ -1635,7 +1752,7 @@ export default function (pi: ExtensionAPI) {
           "error",
         );
       } finally {
-        ctx.ui.setStatus("glean", "");
+        progress.stop();
       }
     },
   });
@@ -1755,7 +1872,7 @@ export default function (pi: ExtensionAPI) {
         "Summarize where we left off in a few lines, so I can continue this work here.";
       const message = `${header}\n\n---\n\n${transcript.text}\n\n---\n\n${instruction}`;
 
-      ctx.ui.setStatus("glean", "Saving session to Glean...");
+      const progress = startProgress(ctx.ui, "Saving session to Glean");
       let answer = "";
       const citations = new Map<string, string>();
       try {
@@ -1775,9 +1892,12 @@ export default function (pi: ExtensionAPI) {
               adoptSavedChat(event.chatId);
               break;
             case "thinking":
-              ctx.ui.setStatus("glean", event.text.trim());
+              progress.status(event.text.trim());
               break;
             case "content":
+              // Glean stops emitting UPDATEs once it starts writing; keep the
+              // line honest about what it is waiting on.
+              if (!answer) progress.status("writing answer");
               answer += event.text;
               break;
             case "citation":
@@ -1786,16 +1906,16 @@ export default function (pi: ExtensionAPI) {
           }
         }
       } catch (err: any) {
+        progress.stop();
         ctx.ui.notify(
           `Glean error: ${(err?.message as string) ?? String(err)}`,
           "error",
         );
         return;
-      } finally {
-        ctx.ui.setStatus("glean", "");
       }
 
       if (!state.chatId) {
+        progress.stop();
         ctx.ui.notify(
           "Glean did not return a chatId — the session was not saved.",
           "error",
@@ -1803,8 +1923,10 @@ export default function (pi: ExtensionAPI) {
         return;
       }
 
+      // The clipboard hop shells out, so keep the spinner up until it settles.
+      progress.status("copying link");
       const url = gleanChatUrl(state.chatId);
-      const copied = await copyLink(url);
+      const copied = await copyLink(url).finally(() => progress.stop());
       const link = `**Saved to Glean:** ${url}`;
       const note = transcript.truncated
         ? `\n\n_${transcript.turns} turns sent; older ones were dropped to fit._`
@@ -1872,7 +1994,7 @@ export default function (pi: ExtensionAPI) {
         return;
       }
 
-      ctx.ui.setStatus("glean", "Loading Glean chat...");
+      const progress = startProgress(ctx.ui, "Loading Glean chat");
       try {
         // GetChatResponse → { chatResult: { chat: { messages } } }.
         const response = await getClient().client.chat.retrieve({ id: chatId });
@@ -1924,7 +2046,7 @@ export default function (pi: ExtensionAPI) {
           "error",
         );
       } finally {
-        ctx.ui.setStatus("glean", "");
+        progress.stop();
       }
     },
   });
