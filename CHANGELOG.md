@@ -5,6 +5,14 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.7.0](https://github.com/pbnj/pi-glean-chat/compare/v1.6.0...v1.7.0) (2026-09-05)
+
+
+### Added
+
+* expose glean as a models.json api provider ([#4](https://github.com/pbnj/pi-glean-chat/issues/4)) ([a46eba7](https://github.com/pbnj/pi-glean-chat/commit/a46eba771eb6d5311ba29bd0944897af21483408))
+* show live progress while glean commands run ([#1](https://github.com/pbnj/pi-glean-chat/issues/1)) ([13cbf58](https://github.com/pbnj/pi-glean-chat/commit/13cbf5818fd7df30a6bc1e8e47388a0884886f69))
+
 ## [1.6.0] - 2026-08-25
 
 ### Added
