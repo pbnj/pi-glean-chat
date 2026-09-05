@@ -50,9 +50,10 @@ Unit tests (`index.test.ts`) run with the built-in Node test runner (Node >=
 23.6 for native type stripping). They cover request building (most-recent-first
 ordering, author mapping, merging, context stripping), ND-JSON stream parsing
 (fragment reassembly per messageId, thinking/text interleaving, citations,
-errors, abort), the OAuth flow (DCR, PKCE code exchange, refresh), and the
-hand-off commands (transcript rendering, `saveChat`, chat-link derivation,
-loading a chat back in) against a mock Glean backend.
+errors, abort), the OAuth flow (DCR, PKCE code exchange, refresh), the hand-off
+commands (transcript rendering, `saveChat`, chat-link derivation, loading a chat
+back in), and `models.json` registration (api registry, model merging, per-model
+reasoning, per-provider OAuth binding) against a mock Glean backend.
 
 ## Environment variables
 
@@ -198,6 +199,69 @@ are appended as a Sources block.
 
 Disable with `GLEAN_ENABLE_MODEL_SURFACE=0` if you want only the tool/command
 surfaces.
+
+### Registering Glean models in `models.json`
+
+The extension registers `glean-chat` as a pi **api**, so you can declare your own
+Glean providers and models in `~/.pi/agent/models.json` — a second tenant, a
+differently-named provider, or one model per reasoning mode:
+
+```json
+{
+  "providers": {
+    "glean-corp": {
+      "name": "Glean (corp)",
+      "baseUrl": "https://mycompany-be.glean.com",
+      "api": "glean-chat",
+      "models": [
+        {
+          "id": "glean-advanced",
+          "name": "Glean Assistant (advanced)",
+          "samplingParams": { "agent": "ADVANCED" }
+        },
+        {
+          "id": "glean-auto",
+          "name": "Glean Assistant (auto)",
+          "samplingParams": { "agent": "AUTO" }
+        }
+      ]
+    }
+  }
+}
+```
+
+Models declared under the `glean` provider id are kept alongside the built-in
+`glean-assistant` (an entry reusing that id replaces it).
+
+**Authentication.** models.json has no way to declare an OAuth flow — its
+`oauth` field only accepts `"radius"` — but this extension lends its own to every
+provider that uses `api: "glean-chat"`, so:
+
+```plaintext
+/login glean-corp     # same browser SSO flow as /login glean, against that entry's baseUrl
+```
+
+Credentials are stored per provider id, so each tenant logs in separately. To use
+a Glean Client API token instead, add `"apiKey": "$GLEAN_API_TOKEN"` (an env var,
+or `$(command)`) to the entry.
+
+**Which model fields do anything here.** Most of the models.json model schema is
+written for token-based LLM APIs and is inert for Glean:
+
+| Field                            | Effect on a `glean-chat` model                                     |
+| -------------------------------- | ------------------------------------------------------------------ |
+| `samplingParams.agent`           | The Glean agent — `ADVANCED` or `AUTO`                             |
+| `contextWindow`                  | When pi compacts the local conversation before sending it (default 128000) |
+| `reasoning` + `thinkingLevelMap` | Maps pi's thinking levels to Glean agents, e.g. `{"low": "AUTO", "high": "ADVANCED"}` |
+| `maxTokens`                      | Ignored — Glean's chat API takes no token budget                   |
+| `cost`                           | Ignored — Glean reports no usage, so cost stays zero               |
+
+A model with no `samplingParams.agent` or `thinkingLevelMap` follows
+`/glean-mode`, like the built-in one. An unrecognized agent (including the
+retired `FAST`) falls back rather than reaching Glean.
+
+The model surface limitations above — no tool calling, stripped context, no token
+accounting — apply to these models too.
 
 ## Conversation threading
 

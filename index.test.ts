@@ -34,18 +34,28 @@ import {
 type Captured = {
   providerName?: string;
   providerConfig?: any;
+  /** Every registerProvider call, in order — the extension makes several. */
+  providers: { name: string; config: any }[];
   tool?: any;
   commands: Record<string, any>;
   entries: any[];
   handlers: Record<string, any[]>;
 };
 
-const captured: Captured = { commands: {}, entries: [], handlers: {} };
+const captured: Captured = {
+  providers: [],
+  commands: {},
+  entries: [],
+  handlers: {},
+};
 
 const piStub = {
   registerProvider: (name: string, cfg: any) => {
-    captured.providerName = name;
-    captured.providerConfig = cfg;
+    captured.providers.push({ name, config: cfg });
+    if (name === "glean") {
+      captured.providerName = name;
+      captured.providerConfig = cfg;
+    }
   },
   registerTool: (cfg: any) => {
     captured.tool = cfg;
@@ -191,12 +201,14 @@ function ndjsonResponder(lines: unknown[]) {
 async function runStream(
   context: any,
   options: any = { apiKey: "test-token" },
+  modelOverrides: Record<string, unknown> = {},
 ) {
   const model = {
     id: "glean-assistant",
     api: "glean-chat",
     provider: "glean",
     baseUrl,
+    ...modelOverrides,
   };
   const stream = captured.providerConfig.streamSimple(model, context, options);
   const events: string[] = [];
@@ -340,6 +352,20 @@ describe("provider registration", () => {
       ["glean-assistant"],
     );
     assert.equal(typeof captured.providerConfig.streamSimple, "function");
+  });
+});
+
+// ── API registration ──────────────────────────────────────────────────────────
+
+describe("api registration", () => {
+  it("registers glean-chat in pi's api registry", async () => {
+    // What lets a models.json provider entry name "api": "glean-chat": pi
+    // resolves an api it does not know through this registry at stream time.
+    const { getApiProvider } = await import("@earendil-works/pi-ai/compat");
+    const api = getApiProvider("glean-chat" as any);
+    assert.ok(api, "glean-chat should be registered");
+    assert.equal(typeof api!.stream, "function");
+    assert.equal(typeof api!.streamSimple, "function");
   });
 });
 
@@ -510,6 +536,68 @@ describe("reasoning mode", () => {
     await captured.commands["glean-mode"].handler("advanced", ctx);
     const added = captured.entries.slice(before);
     assert.ok(added.some((e: any) => e.reasoningMode === "ADVANCED"));
+  });
+
+  it("takes the agent from the model's samplingParams", async () => {
+    // How a models.json entry pins one model to one agent, so `glean-advanced`
+    // and `glean-auto` can be separate selectable models.
+    const ctx = makeCommandCtx();
+    await captured.commands["glean-mode"].handler("auto", ctx);
+    await runStream({ messages: [userMsg("hi")] }, { apiKey: "test-token" }, {
+      samplingParams: { agent: "ADVANCED" },
+    });
+    assert.deepEqual(lastRequestBody.agentConfig, { agent: "ADVANCED" });
+  });
+
+  it("lets per-request samplingParams override the model's", async () => {
+    await runStream(
+      { messages: [userMsg("hi")] },
+      { apiKey: "test-token", samplingParams: { agent: "auto" } },
+      { samplingParams: { agent: "ADVANCED" } },
+    );
+    assert.deepEqual(lastRequestBody.agentConfig, { agent: "AUTO" });
+  });
+
+  it("maps the thinking level through thinkingLevelMap", async () => {
+    const ctx = makeCommandCtx();
+    await captured.commands["glean-mode"].handler("auto", ctx);
+    await runStream(
+      { messages: [userMsg("hi")] },
+      { apiKey: "test-token", reasoning: "high" },
+      { thinkingLevelMap: { low: "AUTO", high: "ADVANCED" } },
+    );
+    assert.deepEqual(lastRequestBody.agentConfig, { agent: "ADVANCED" });
+  });
+
+  it("falls back to the session mode when a model names an unknown agent", async () => {
+    // A stale FAST in someone's models.json must not reach the retired agent.
+    const ctx = makeCommandCtx();
+    await captured.commands["glean-mode"].handler("advanced", ctx);
+    await runStream({ messages: [userMsg("hi")] }, { apiKey: "test-token" }, {
+      samplingParams: { agent: "FAST" },
+    });
+    assert.deepEqual(lastRequestBody.agentConfig, { agent: "ADVANCED" });
+  });
+
+  it("renders the active model's own agent in the footer", async () => {
+    const ctx = makeCommandCtx();
+    await captured.commands["glean-mode"].handler("auto", ctx);
+    await fireEvent(
+      "model_select",
+      {
+        model: {
+          id: "glean-advanced",
+          provider: "glean-corp",
+          api: "glean-chat",
+          samplingParams: { agent: "ADVANCED" },
+        },
+      },
+      ctx,
+    );
+    // Recognized by api, not provider id, so a models.json provider gets the
+    // Glean footer too — showing its own agent rather than the session mode.
+    const lines = renderFooter(ctx.getFooter());
+    assert.ok(lines[1].includes("(glean-corp) glean-advanced • advanced"));
   });
 
   it("renders a custom footer with model and reasoning mode when Glean is active", async () => {
@@ -1768,5 +1856,179 @@ describe("configuration resolution", () => {
     assert.equal(resolveGleanToken(), "");
     writeAuth({ type: "oauth", access: "stale", expires: 1, env: { GLEAN_API_TOKEN: "fallback" } });
     assert.equal(resolveGleanToken(), "fallback");
+  });
+});
+
+// ── models.json ───────────────────────────────────────────────────────────────
+//
+// A user declaring Glean models in ~/.pi/agent/models.json. The extension reads
+// the file as it loads (before any ExtensionContext exists), so each case points
+// HOME at a temp dir, writes a models.json, and re-runs the extension factory
+// against a fresh stub.
+
+describe("models.json providers", () => {
+  let savedHome: string | undefined;
+  let home: string;
+
+  /** Load the extension against a fresh stub with the given models.json. */
+  async function loadWith(modelsJson: unknown) {
+    const dir = join(home, ".pi", "agent");
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, "models.json"), JSON.stringify(modelsJson));
+    const registered: { name: string; config: any }[] = [];
+    const stub = {
+      ...piStub,
+      registerProvider: (name: string, config: any) =>
+        registered.push({ name, config }),
+    } as any;
+    const ext = await import("./index.ts");
+    ext.default(stub);
+    return registered;
+  }
+
+  beforeEach(() => {
+    savedHome = process.env.HOME;
+    home = mkdtempSync(join(tmpdir(), "glean-models-"));
+    process.env.HOME = home;
+  });
+
+  afterEach(() => {
+    if (savedHome === undefined) delete process.env.HOME;
+    else process.env.HOME = savedHome;
+    rmSync(home, { recursive: true, force: true });
+  });
+
+  it("keeps models declared under the glean provider alongside the built-in", async () => {
+    // A provider config from an extension replaces the model list wholesale, so
+    // without the merge these would vanish.
+    const registered = await loadWith({
+      providers: {
+        glean: {
+          models: [
+            { id: "glean-advanced", samplingParams: { agent: "ADVANCED" } },
+          ],
+        },
+      },
+    });
+    const glean = registered.find((p) => p.name === "glean")!;
+    assert.deepEqual(
+      glean.config.models.map((m: any) => m.id),
+      ["glean-assistant", "glean-advanced"],
+    );
+    const advanced = glean.config.models[1];
+    assert.deepEqual(advanced.samplingParams, { agent: "ADVANCED" });
+    // Fields models.json leaves out are filled from the built-in, which pi
+    // requires but models.json treats as optional.
+    assert.equal(advanced.name, "glean-advanced");
+    assert.equal(advanced.contextWindow, 128000);
+  });
+
+  it("lets a models.json entry override the built-in model by id", async () => {
+    const registered = await loadWith({
+      providers: {
+        glean: { models: [{ id: "glean-assistant", contextWindow: 32000 }] },
+      },
+    });
+    const glean = registered.find((p) => p.name === "glean")!;
+    assert.equal(glean.config.models.length, 1);
+    assert.equal(glean.config.models[0].contextWindow, 32000);
+    // Overriding a field must not cost the model its display name.
+    assert.equal(glean.config.models[0].name, "Glean Assistant");
+  });
+
+  it("lends the oauth flow to a user-declared provider id", async () => {
+    // models.json cannot express an OAuth method (its `oauth` field only takes
+    // "radius"), so /login glean-corp only works because we register one.
+    const registered = await loadWith({
+      providers: {
+        "glean-corp": {
+          api: "glean-chat",
+          baseUrl: "https://corp-be.glean.com",
+          models: [{ id: "glean-advanced" }],
+        },
+      },
+    });
+    const corp = registered.find((p) => p.name === "glean-corp");
+    assert.ok(corp, "glean-corp should be registered");
+    assert.equal(typeof corp!.config.oauth.login, "function");
+    assert.equal(corp!.config.api, "glean-chat");
+    assert.equal(typeof corp!.config.streamSimple, "function");
+    // Neither may be set: both would override what the user wrote.
+    assert.equal(corp!.config.models, undefined);
+    assert.equal(corp!.config.baseUrl, undefined);
+  });
+
+  it("ignores providers that do not use the glean-chat api", async () => {
+    const registered = await loadWith({
+      providers: {
+        "my-proxy": {
+          api: "openai-completions",
+          baseUrl: "https://proxy.example.com",
+        },
+      },
+    });
+    assert.equal(
+      registered.find((p) => p.name === "my-proxy"),
+      undefined,
+    );
+  });
+
+  it("recognizes the api declared at model level", async () => {
+    const registered = await loadWith({
+      providers: {
+        "glean-eu": {
+          baseUrl: "https://eu-be.glean.com",
+          models: [{ id: "glean-assistant", api: "glean-chat" }],
+        },
+      },
+    });
+    assert.ok(registered.find((p) => p.name === "glean-eu"));
+  });
+
+  it("survives a malformed models.json", async () => {
+    const dir = join(home, ".pi", "agent");
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, "models.json"), "{ not json");
+    const registered: { name: string; config: any }[] = [];
+    const ext = await import("./index.ts");
+    ext.default({
+      ...piStub,
+      registerProvider: (name: string, config: any) =>
+        registered.push({ name, config }),
+    } as any);
+    // The built-in surface still registers; pi reports the parse error itself.
+    assert.ok(registered.find((p) => p.name === "glean"));
+  });
+
+  it("binds each provider's oauth flow to its own backend", async () => {
+    // pi hands the login function no provider context, so the URL has to be
+    // captured at registration — otherwise a second tenant authenticates
+    // against whatever GLEAN_BACKEND_URL happens to say.
+    const registered = await loadWith({
+      providers: {
+        "glean-corp": { api: "glean-chat", baseUrl },
+      },
+    });
+    const corp = registered.find((p) => p.name === "glean-corp")!;
+    const savedBackend = process.env.GLEAN_BACKEND_URL;
+    process.env.GLEAN_BACKEND_URL = "http://127.0.0.1:1"; // nothing listening
+    try {
+      const creds = await corp.config.oauth.login({
+        onAuth: ({ url }: { url: string }) => {
+          const authUrl = new URL(url);
+          const redirect = new URL(authUrl.searchParams.get("redirect_uri")!);
+          redirect.searchParams.set("code", "auth-code-1");
+          redirect.searchParams.set("state", authUrl.searchParams.get("state")!);
+          fetch(redirect).catch(() => {});
+        },
+        onDeviceCode: () => {},
+        onPrompt: async () => "",
+        onSelect: async () => undefined,
+      });
+      assert.equal(creds.access, "access-authorization_code");
+    } finally {
+      if (savedBackend === undefined) delete process.env.GLEAN_BACKEND_URL;
+      else process.env.GLEAN_BACKEND_URL = savedBackend;
+    }
   });
 });
