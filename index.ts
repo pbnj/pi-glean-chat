@@ -19,6 +19,13 @@
  *                         no system prompt, no usage data. Disable with
  *                         GLEAN_ENABLE_MODEL_SURFACE=0.
  *
+ *                         The same surface is available to models.json: this
+ *                         extension registers the `glean-chat` api with pi, so
+ *                         a provider entry naming it routes through Glean too.
+ *                         Such models pick their agent from
+ *                         samplingParams.agent / thinkingLevelMap, and get the
+ *                         OAuth login lent to their provider id.
+ *
  * Required env vars:
  *   GLEAN_BACKEND_URL  — e.g. https://mycompany-be.glean.com
  *                        (or set GLEAN_INSTANCE as fallback)
@@ -33,6 +40,8 @@ import type {
   ExtensionAPI,
   ExtensionContext,
   ExtensionUIContext,
+  ProviderConfig,
+  ProviderModelConfig,
   SessionEntry,
 } from "@earendil-works/pi-coding-agent";
 import {
@@ -46,6 +55,11 @@ import {
   type OAuthLoginCallbacks,
   type SimpleStreamOptions,
 } from "@earendil-works/pi-ai";
+// The api-registry lives on the /compat subpath: the package root is core-only
+// and does not re-export it. pi aliases both specifiers to its own pi-ai
+// instance when loading extensions, so this registers into the very registry
+// pi's provider composer reads from.
+import { registerApiProvider } from "@earendil-works/pi-ai/compat";
 import { readFileSync } from "node:fs";
 import { createServer } from "node:http";
 import { homedir } from "node:os";
@@ -92,6 +106,102 @@ function authEnv(
   const env = entry?.env as Record<string, unknown> | undefined;
   const value = env?.[name];
   return typeof value === "string" && value ? value : undefined;
+}
+
+// ── models.json ───────────────────────────────────────────────────────────────
+//
+// The pi `api` id this extension implements. Registered in pi's api registry
+// (see the entry point) so a models.json provider entry can name it directly:
+//
+//   "providers": { "glean-corp": { "api": "glean-chat", "baseUrl": …, … } }
+//
+// pi resolves an unknown api through that registry at stream time, so any
+// provider id — not just the `glean` one this extension registers itself — can
+// route through Glean Chat.
+const GLEAN_API = "glean-chat" as Api;
+
+/** A model as it may appear in models.json: every field but `id` is optional. */
+type ModelsJsonModel = Partial<ProviderModelConfig> & {
+  id: string;
+  samplingParams?: Record<string, unknown>;
+};
+
+/** A provider entry as it may appear in models.json. */
+interface ModelsJsonProvider {
+  name?: string;
+  baseUrl?: string;
+  api?: string;
+  models?: ModelsJsonModel[];
+}
+
+/**
+ * `providers` from ~/.pi/agent/models.json, or {}.
+ *
+ * Read directly rather than through pi, for the same reason `readGleanAuthEntry`
+ * reads auth.json directly: provider registration happens as the extension
+ * loads, before any ExtensionContext (and so any model registry) exists.
+ */
+function readModelsJsonProviders(): Record<string, ModelsJsonProvider> {
+  try {
+    const path = join(homedir(), ".pi", "agent", "models.json");
+    const parsed = JSON.parse(readFileSync(path, "utf-8")) as {
+      providers?: Record<string, ModelsJsonProvider>;
+    };
+    return parsed?.providers ?? {};
+  } catch {
+    // models.json absent, unreadable, or malformed — pi reports the parse error
+    // itself; there is nothing useful this extension can add.
+    return {};
+  }
+}
+
+/** True when a models.json entry routes any of its models through Glean Chat. */
+function usesGleanApi(entry: ModelsJsonProvider): boolean {
+  return (
+    entry.api === GLEAN_API ||
+    (entry.models ?? []).some((model) => model.api === GLEAN_API)
+  );
+}
+
+/** The backend URL a models.json entry talks to, provider level then model. */
+function entryBaseUrl(entry: ModelsJsonProvider): string | undefined {
+  return (
+    entry.baseUrl ?? entry.models?.find((model) => model.baseUrl)?.baseUrl
+  );
+}
+
+/** A registered model, plus the sampling params pi's public type omits. */
+type GleanModelConfig = ProviderModelConfig & {
+  samplingParams?: Record<string, unknown>;
+};
+
+/**
+ * The built-in model plus any the user declared for the same provider in
+ * models.json, with a matching `id` replacing the built-in rather than
+ * duplicating it.
+ *
+ * The merge is necessary because a provider config supplied by an extension
+ * *replaces* the model list wholesale — without it, declaring models under the
+ * `glean` provider in models.json would silently drop them. Fields models.json
+ * leaves out fall back to the built-in's, which pi requires but models.json
+ * treats as optional.
+ */
+function mergeModelsJsonModels(
+  builtIn: GleanModelConfig,
+  entry: ModelsJsonProvider | undefined,
+): GleanModelConfig[] {
+  const models: GleanModelConfig[] = [builtIn];
+  for (const model of entry?.models ?? []) {
+    if (!model?.id) continue;
+    const merged: GleanModelConfig = { ...builtIn, ...model };
+    // Unnamed models fall back to their id, as pi's own models.json loader
+    // does — except when overriding the built-in, whose name is worth keeping.
+    if (!model.name && model.id !== builtIn.id) merged.name = model.id;
+    const existing = models.findIndex((m) => m.id === merged.id);
+    if (existing >= 0) models[existing] = merged;
+    else models.push(merged);
+  }
+  return models;
 }
 
 /**
@@ -237,6 +347,44 @@ function reasoningAgentConfig(override?: string): { agent: ReasoningMode } {
   return { agent: explicit ?? currentReasoningMode() };
 }
 
+/** `samplingParams.agent` as a mode, if it names one we support. */
+function samplingAgent(
+  params: Record<string, unknown> | undefined,
+): ReasoningMode | undefined {
+  const agent = params?.agent;
+  return typeof agent === "string" ? normalizeReasoningMode(agent) : undefined;
+}
+
+/**
+ * The Glean agent for a model-surface request, most specific source first:
+ *
+ *   1. `options.samplingParams.agent`   — per-request override
+ *   2. `model.samplingParams.agent`     — pins one models.json model to an agent,
+ *                                         so `glean-advanced` and `glean-auto`
+ *                                         can be separate entries
+ *   3. `model.thinkingLevelMap[level]`  — lets pi's thinking-level UI drive the
+ *                                         agent on a model declared reasoning
+ *   4. the session / env mode           — what /glean-mode sets
+ *
+ * Every candidate goes through normalizeReasoningMode, so a typo or a retired
+ * FAST falls through to the next source rather than reaching Glean.
+ */
+function modelReasoningMode(
+  model: Pick<Model<Api>, "samplingParams" | "thinkingLevelMap">,
+  options?: SimpleStreamOptions,
+): ReasoningMode {
+  // pi drops the level entirely when thinking is off, so an absent `reasoning`
+  // simply falls through to the session mode.
+  const level = options?.reasoning;
+  const mapped = level ? model.thinkingLevelMap?.[level] : undefined;
+  return (
+    samplingAgent(options?.samplingParams) ??
+    samplingAgent(model.samplingParams) ??
+    (mapped ? normalizeReasoningMode(mapped) : undefined) ??
+    currentReasoningMode()
+  );
+}
+
 // State captured from session/model events so the custom footer can render the
 // active Glean model and reasoning mode. When the Glean model is selected we
 // replace pi's footer entirely (Glean exposes no token/context/cost data, so
@@ -244,7 +392,11 @@ function reasoningAgentConfig(override?: string): { agent: ReasoningMode } {
 // built-in footer.
 let activeIsGlean = false;
 let gleanFooterActive = false;
-let footerModel: { id: string; provider: string } = {
+type FooterModel = Pick<Model<Api>, "samplingParams" | "thinkingLevelMap"> & {
+  id: string;
+  provider: string;
+};
+let footerModel: FooterModel = {
   id: "glean-assistant",
   provider: "glean",
 };
@@ -265,9 +417,18 @@ type FooterData = {
   getExtensionStatuses?(): ReadonlyMap<string, string>;
 };
 
-/** True when a model belongs to the Glean provider. */
-function isGleanModel(model: { provider?: string } | undefined): boolean {
-  return model?.provider === "glean";
+/**
+ * True when a model routes through Glean Chat.
+ *
+ * Keyed on the api rather than the provider id, so a provider a user declared in
+ * models.json under any name gets the Glean footer too. The provider-id check
+ * stays as a fallback for the extension's own registration, whose models carry
+ * the api only after pi has composed them.
+ */
+function isGleanModel(
+  model: { provider?: string; api?: string } | undefined,
+): boolean {
+  return model?.api === GLEAN_API || model?.provider === "glean";
 }
 
 /** Visible width of a string, ignoring ANSI SGR escape codes. */
@@ -317,7 +478,7 @@ function makeGleanFooter(
         ? `(${footerModel.provider}) ${footerModel.id}`
         : footerModel.id;
       const right = truncatePlain(
-        `${modelSeg} • ${currentReasoningMode().toLowerCase()}`,
+        `${modelSeg} • ${modelReasoningMode(footerModel).toLowerCase()}`,
         width,
       );
       const pad = " ".repeat(Math.max(0, width - visibleWidth(right)));
@@ -689,8 +850,9 @@ function credentialsFromTokens(
 
 async function loginGlean(
   callbacks: OAuthLoginCallbacks,
+  backendUrl?: string,
 ): Promise<OAuthCredentials> {
-  const baseUrl = resolveGleanBaseUrl();
+  const baseUrl = backendUrl ?? resolveGleanBaseUrl();
   if (!baseUrl)
     throw new Error("Set GLEAN_BACKEND_URL or GLEAN_INSTANCE before /login glean");
 
@@ -735,8 +897,9 @@ async function loginGlean(
 
 async function refreshGleanToken(
   credentials: OAuthCredentials,
+  backendUrl?: string,
 ): Promise<OAuthCredentials> {
-  const baseUrl = resolveGleanBaseUrl();
+  const baseUrl = backendUrl ?? resolveGleanBaseUrl();
   if (!baseUrl) throw new Error("GLEAN_BACKEND_URL / GLEAN_INSTANCE not set");
   const clientId = typeof credentials.clientId === "string" ? credentials.clientId : "";
   if (!credentials.refresh || !clientId)
@@ -748,6 +911,25 @@ async function refreshGleanToken(
     client_id: clientId,
   });
   return credentialsFromTokens(tokens, clientId, credentials.refresh);
+}
+
+/**
+ * OAuth config bound to one backend URL.
+ *
+ * The URL has to be captured here, at registration: pi hands the login function
+ * only its callbacks — no provider, no model — so a flow shared between two
+ * tenants has no way to ask which one it is authenticating against. Omit the
+ * argument to keep the env / auth.json resolution.
+ */
+function makeGleanOAuth(
+  backendUrl?: string,
+): NonNullable<ProviderConfig["oauth"]> {
+  return {
+    name: "Glean (SSO via OAuth)",
+    login: (callbacks) => loginGlean(callbacks, backendUrl),
+    refreshToken: (credentials) => refreshGleanToken(credentials, backendUrl),
+    getApiKey: (credentials) => credentials.access,
+  };
 }
 
 // ── Model surface (provider) ──────────────────────────────────────────────────
@@ -1343,7 +1525,7 @@ function streamGlean(
         token,
         baseUrl,
         messages: buildGleanMessages(context),
-        agentConfig: reasoningAgentConfig(),
+        agentConfig: { agent: modelReasoningMode(model, options) },
         signal: options?.signal ?? null,
       })) {
         processEvent(event);
@@ -1381,33 +1563,63 @@ function streamGlean(
 // ── Extension entry point ─────────────────────────────────────────────────────
 
 export default function (pi: ExtensionAPI) {
+  // Teach pi how to talk `glean-chat`, unconditionally: a models.json entry
+  // carries its own baseUrl and credentials, so neither an env backend URL nor
+  // the model surface being enabled is a precondition. pi looks this up lazily,
+  // at stream time, keyed by the api id.
+  try {
+    registerApiProvider(
+      { api: GLEAN_API, stream: streamGlean, streamSimple: streamGlean },
+      "pi-glean-chat",
+    );
+  } catch (err) {
+    // An older pi without the api registry: the extension's own provider
+    // registration still works, only models.json entries are unavailable.
+    console.error(
+      `glean-chat: could not register the api implementation — models.json ` +
+        `providers using "api": "${GLEAN_API}" will not work. ` +
+        `${err instanceof Error ? err.message : String(err)}`,
+    );
+  }
+
+  const modelsJson = readModelsJsonProviders();
+
   // Model surface: glean / Glean Assistant. Registered only when a backend
   // URL is configured; disable explicitly with GLEAN_ENABLE_MODEL_SURFACE=0.
   const modelBaseUrl = resolveGleanBaseUrl();
   if (process.env.GLEAN_ENABLE_MODEL_SURFACE !== "0" && modelBaseUrl) {
+    const gleanAssistant: ProviderModelConfig = {
+      id: "glean-assistant",
+      name: "Glean Assistant",
+      reasoning: false,
+      input: ["text"],
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+      contextWindow: 128000,
+      maxTokens: 8192,
+    };
     pi.registerProvider("glean", {
       name: "Glean",
       baseUrl: modelBaseUrl,
       apiKey: "$GLEAN_API_TOKEN",
-      api: "glean-chat" as Api,
-      models: [
-        {
-          id: "glean-assistant",
-          name: "Glean Assistant",
-          reasoning: false,
-          input: ["text"],
-          cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-          contextWindow: 128000,
-          maxTokens: 8192,
-        },
-      ],
-      oauth: {
-        name: "Glean (SSO via OAuth)",
-        login: loginGlean,
-        refreshToken: refreshGleanToken,
-        getApiKey: (credentials) => credentials.access,
-      },
+      api: GLEAN_API,
+      models: mergeModelsJsonModels(gleanAssistant, modelsJson.glean),
+      oauth: makeGleanOAuth(modelBaseUrl),
       streamSimple: streamGlean,
+    });
+  }
+
+  // Lend the OAuth flow to provider ids the user declared in models.json.
+  // models.json cannot express an OAuth method of its own (its `oauth` field
+  // only accepts "radius"), but pi composes auth per provider id from the
+  // extension layer — so registering the method here is what makes
+  // `/login <id>` work for a second tenant. No `models` or `baseUrl`: supplying
+  // either would override what the user wrote in models.json.
+  for (const [id, entry] of Object.entries(modelsJson)) {
+    if (id === "glean" || !usesGleanApi(entry)) continue;
+    pi.registerProvider(id, {
+      api: GLEAN_API,
+      streamSimple: streamGlean,
+      oauth: makeGleanOAuth(entryBaseUrl(entry)),
     });
   }
 
@@ -1418,7 +1630,7 @@ export default function (pi: ExtensionAPI) {
     piContext = ctx;
     footerCwd = ctx.cwd ?? process.cwd();
     activeIsGlean = isGleanModel(ctx.model);
-    if (ctx.model) footerModel = { id: ctx.model.id, provider: ctx.model.provider };
+    if (ctx.model) footerModel = ctx.model;
     _client = undefined;
     state = { chatId: undefined, saved: undefined };
     for (const entry of ctx.sessionManager.getEntries()) {
@@ -1437,8 +1649,7 @@ export default function (pi: ExtensionAPI) {
   pi.on("model_select", async (event, ctx) => {
     footerCwd = ctx.cwd ?? footerCwd;
     activeIsGlean = isGleanModel(event.model);
-    if (event.model)
-      footerModel = { id: event.model.id, provider: event.model.provider };
+    if (event.model) footerModel = event.model;
     applyGleanFooter(ctx.ui, ctx.mode);
   });
 
