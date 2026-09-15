@@ -26,10 +26,12 @@
  *                         samplingParams.agent / thinkingLevelMap, and get the
  *                         OAuth login lent to their provider id.
  *
- * Required env vars:
+ * Backend configuration:
  *   GLEAN_BACKEND_URL  — e.g. https://mycompany-be.glean.com
  *                        (or set GLEAN_INSTANCE as fallback)
  *   GLEAN_INSTANCE     — instance name, e.g. "mycompany"
+ *   ~/.pi/agent/models.json — providers.glean.baseUrl is used when neither
+ *                             environment variable is set
  *
  * Token: /login glean (OAuth via Glean's authorization server + your SSO,
  * persisted in ~/.pi/agent/auth.json), or paste an API key at /login, or
@@ -164,9 +166,9 @@ function usesGleanApi(entry: ModelsJsonProvider): boolean {
 }
 
 /** The backend URL a models.json entry talks to, provider level then model. */
-function entryBaseUrl(entry: ModelsJsonProvider): string | undefined {
+function entryBaseUrl(entry: ModelsJsonProvider | undefined): string | undefined {
   return (
-    entry.baseUrl ?? entry.models?.find((model) => model.baseUrl)?.baseUrl
+    entry?.baseUrl ?? entry?.models?.find((model) => model.baseUrl)?.baseUrl
   );
 }
 
@@ -248,8 +250,8 @@ async function resolveTokenViaPi(
 let piContext: Pick<ExtensionContext, "modelRegistry"> | undefined;
 
 function makeClient(): Glean {
-  // Same resolution as the model surface (env, then auth.json), so the tool and
-  // the provider can never disagree about which backend they are talking to.
+  // Same resolution as the model surface (env, auth.json, then models.json),
+  // so the tool and the provider can never disagree about their backend.
   const serverURL = resolveGleanBaseUrl();
   const instance =
     process.env.GLEAN_INSTANCE ??
@@ -854,7 +856,10 @@ async function loginGlean(
 ): Promise<OAuthCredentials> {
   const baseUrl = backendUrl ?? resolveGleanBaseUrl();
   if (!baseUrl)
-    throw new Error("Set GLEAN_BACKEND_URL or GLEAN_INSTANCE before /login glean");
+    throw new Error(
+      "Set GLEAN_BACKEND_URL or GLEAN_INSTANCE, or configure " +
+        "providers.glean.baseUrl in ~/.pi/agent/models.json, before /login glean",
+    );
 
   const meta = await fetchOAuthMetadata(baseUrl);
   if (!meta.registration_endpoint)
@@ -900,7 +905,11 @@ async function refreshGleanToken(
   backendUrl?: string,
 ): Promise<OAuthCredentials> {
   const baseUrl = backendUrl ?? resolveGleanBaseUrl();
-  if (!baseUrl) throw new Error("GLEAN_BACKEND_URL / GLEAN_INSTANCE not set");
+  if (!baseUrl)
+    throw new Error(
+      "Set GLEAN_BACKEND_URL or GLEAN_INSTANCE, or configure " +
+        "providers.glean.baseUrl in ~/.pi/agent/models.json",
+    );
   const clientId = typeof credentials.clientId === "string" ? credentials.clientId : "";
   if (!credentials.refresh || !clientId)
     throw new Error("No refresh token or client_id — run /login glean again");
@@ -948,12 +957,13 @@ function makeGleanOAuth(
  *   1. GLEAN_BACKEND_URL / GLEAN_INSTANCE env vars
  *   2. ~/.pi/agent/auth.json  glean entry: env.GLEAN_BACKEND_URL,
  *      env.GLEAN_INSTANCE, backendUrl, or instance
+ *   3. ~/.pi/agent/models.json  providers.glean.baseUrl (or a model-level
+ *      baseUrl when the provider-level value is omitted)
  *
- * The file fallback matters because the model surface is registered only when a
- * URL resolves (see the entry point). Env-only resolution meant pi worked in an
- * interactive shell and reported `Model "glean" not found` anywhere the profile
- * had not been sourced -- cron, launchd, a bare `env -i` -- even with a perfectly
- * good credential sitting in auth.json.
+ * The file fallbacks matter because the model surface and the tool/command
+ * surfaces are registered or invoked outside the model picker. In particular,
+ * a backend configured only in models.json must still make `/login glean`,
+ * `/glean`, and `glean_chat` use the same tenant.
  */
 export function resolveGleanBaseUrl(): string | undefined {
   let url = process.env.GLEAN_BACKEND_URL;
@@ -966,6 +976,9 @@ export function resolveGleanBaseUrl(): string | undefined {
     instance =
       authEnv(glean, "GLEAN_INSTANCE") ??
       (typeof glean?.instance === "string" ? glean.instance : undefined);
+  }
+  if (!url && !instance) {
+    url = entryBaseUrl(readModelsJsonProviders().glean);
   }
   if (!url && instance) url = `https://${instance}-be.glean.com`;
   if (!url) return undefined;
@@ -1518,7 +1531,8 @@ function streamGlean(
       );
       if (!baseUrl)
         throw new Error(
-          "No Glean backend URL. Set GLEAN_BACKEND_URL or GLEAN_INSTANCE",
+          "No Glean backend URL. Set GLEAN_BACKEND_URL or GLEAN_INSTANCE, " +
+            "or configure providers.glean.baseUrl in ~/.pi/agent/models.json",
         );
 
       for await (const event of streamGleanChat({
@@ -1585,7 +1599,8 @@ export default function (pi: ExtensionAPI) {
   const modelsJson = readModelsJsonProviders();
 
   // Model surface: glean / Glean Assistant. Registered only when a backend
-  // URL is configured; disable explicitly with GLEAN_ENABLE_MODEL_SURFACE=0.
+  // URL is configured through env/auth.json/models.json; disable explicitly
+  // with GLEAN_ENABLE_MODEL_SURFACE=0.
   const modelBaseUrl = resolveGleanBaseUrl();
   if (process.env.GLEAN_ENABLE_MODEL_SURFACE !== "0" && modelBaseUrl) {
     const gleanAssistant: ProviderModelConfig = {
@@ -1746,8 +1761,9 @@ export default function (pi: ExtensionAPI) {
               type: "text",
               text:
                 "No Glean backend URL. " +
-                "Set GLEAN_BACKEND_URL (e.g. https://acme-be.glean.com) " +
-                "or GLEAN_INSTANCE.",
+                "Set GLEAN_BACKEND_URL (e.g. https://acme-be.glean.com), " +
+                "GLEAN_INSTANCE, or configure providers.glean.baseUrl in " +
+                "~/.pi/agent/models.json.",
             },
           ],
           details: {},
@@ -2045,7 +2061,8 @@ export default function (pi: ExtensionAPI) {
       const baseUrl = resolveGleanBaseUrl();
       if (!baseUrl) {
         ctx.ui.notify(
-          "No Glean backend URL. Set GLEAN_BACKEND_URL or GLEAN_INSTANCE.",
+          "No Glean backend URL. Set GLEAN_BACKEND_URL or GLEAN_INSTANCE, " +
+            "or configure providers.glean.baseUrl in ~/.pi/agent/models.json.",
           "error",
         );
         return;

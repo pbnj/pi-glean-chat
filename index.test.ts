@@ -1771,6 +1771,12 @@ describe("configuration resolution", () => {
     writeFileSync(join(dir, "auth.json"), JSON.stringify({ glean }));
   }
 
+  function writeModelsJson(providers: unknown) {
+    const dir = join(home, ".pi", "agent");
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, "models.json"), JSON.stringify({ providers }));
+  }
+
   it("resolves the URL from GLEAN_BACKEND_URL", () => {
     process.env.GLEAN_BACKEND_URL = "https://acme-be.glean.com";
     assert.equal(resolveGleanBaseUrl(), "https://acme-be.glean.com");
@@ -1796,6 +1802,23 @@ describe("configuration resolution", () => {
     assert.equal(resolveGleanBaseUrl(), "https://bare-be.glean.com");
     writeAuth({ type: "api_key", key: "k", instance: "bare" });
     assert.equal(resolveGleanBaseUrl(), "https://bare-be.glean.com");
+  });
+
+  it("resolves the URL from the glean provider in models.json", () => {
+    writeModelsJson({
+      glean: { baseUrl: "https://from-models-be.glean.com/rest/api/v1///" },
+    });
+    assert.equal(resolveGleanBaseUrl(), "https://from-models-be.glean.com");
+  });
+
+  it("prefers auth.json over models.json", () => {
+    writeModelsJson({ glean: { baseUrl: "https://models-be.glean.com" } });
+    writeAuth({
+      type: "api_key",
+      key: "k",
+      backendUrl: "https://auth-be.glean.com",
+    });
+    assert.equal(resolveGleanBaseUrl(), "https://auth-be.glean.com");
   });
 
   it("prefers env over auth.json", () => {
@@ -1896,6 +1919,26 @@ describe("models.json providers", () => {
     if (savedHome === undefined) delete process.env.HOME;
     else process.env.HOME = savedHome;
     rmSync(home, { recursive: true, force: true });
+  });
+
+  it("uses the glean provider baseUrl when environment configuration is absent", async () => {
+    const savedBackend = process.env.GLEAN_BACKEND_URL;
+    const savedInstance = process.env.GLEAN_INSTANCE;
+    delete process.env.GLEAN_BACKEND_URL;
+    delete process.env.GLEAN_INSTANCE;
+    try {
+      const registered = await loadWith({
+        providers: { glean: { baseUrl: "https://models-be.glean.com" } },
+      });
+      const glean = registered.find((p) => p.name === "glean");
+      assert.ok(glean, "glean should be registered from models.json");
+      assert.equal(glean!.config.baseUrl, "https://models-be.glean.com");
+    } finally {
+      if (savedBackend === undefined) delete process.env.GLEAN_BACKEND_URL;
+      else process.env.GLEAN_BACKEND_URL = savedBackend;
+      if (savedInstance === undefined) delete process.env.GLEAN_INSTANCE;
+      else process.env.GLEAN_INSTANCE = savedInstance;
+    }
   });
 
   it("keeps models declared under the glean provider alongside the built-in", async () => {

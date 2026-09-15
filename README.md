@@ -21,6 +21,22 @@ Set the backend URL (shell profile):
 export GLEAN_BACKEND_URL="https://mycompany-be.glean.com"
 ```
 
+Or configure it in `~/.pi/agent/models.json` under the `glean` provider:
+
+```json
+{
+  "providers": {
+    "glean": {
+      "baseUrl": "https://mycompany-be.glean.com",
+      "api": "glean-chat"
+    }
+  }
+}
+```
+
+Environment variables take precedence, followed by the Glean entry in
+`auth.json`, then `providers.glean.baseUrl` from `models.json`.
+
 Authenticate in pi:
 
 ```plaintext
@@ -59,8 +75,8 @@ reasoning, per-provider OAuth binding) against a mock Glean backend.
 
 | Variable                     | Required | Description                                                               |
 | ---------------------------- | -------- | ------------------------------------------------------------------------- |
-| `GLEAN_BACKEND_URL`          | one of   | Full backend URL, e.g. `https://mycompany-be.glean.com`                   |
-| `GLEAN_INSTANCE`             | one of   | Instance name, e.g. `mycompany` — used when `GLEAN_BACKEND_URL` is absent |
+| `GLEAN_BACKEND_URL`          | no       | Full backend URL, e.g. `https://mycompany-be.glean.com`                   |
+| `GLEAN_INSTANCE`             | no       | Instance name, e.g. `mycompany` — used when `GLEAN_BACKEND_URL` is absent |
 | `GLEAN_API_TOKEN`            | no       | Glean Client API token — overrides the token stored in `auth.json`        |
 | `GLEAN_ENABLE_MODEL_SURFACE` | no       | Set to `0` to disable the provider/model surface                          |
 | `GLEAN_REASONING_MODE`       | no       | Default reasoning mode: `advanced` or `auto` (default `auto`)             |
@@ -180,8 +196,9 @@ footer.
 ### Model: `glean / Glean Assistant`
 
 Selectable via `Ctrl+P` or `/model`. Routes the active conversation through
-Glean Chat instead of a normal LLM. Registered only when `GLEAN_BACKEND_URL` or
-`GLEAN_INSTANCE` is set at startup.
+Glean Chat instead of a normal LLM. Registered when a backend URL is available
+from `GLEAN_BACKEND_URL`, `GLEAN_INSTANCE`, `auth.json`, or
+`providers.glean.baseUrl` in `models.json` at startup.
 
 Streaming is real: the provider calls `/rest/api/v1/chat` with `stream: true`
 and parses ND-JSON lines as they arrive. Glean `UPDATE`/`HEADING` progress
@@ -231,7 +248,9 @@ differently-named provider, or one model per reasoning mode:
 ```
 
 Models declared under the `glean` provider id are kept alongside the built-in
-`glean-assistant` (an entry reusing that id replaces it).
+`glean-assistant` (an entry reusing that id replaces it). The `baseUrl` on that
+provider is also used by `/login glean`, `/glean`, `glean_chat`, and the hand-off
+commands when no environment or `auth.json` URL is configured.
 
 **Authentication.** models.json has no way to declare an OAuth flow — its
 `oauth` field only accepts `"radius"` — but this extension lends its own to every
