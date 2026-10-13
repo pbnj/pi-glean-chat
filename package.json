@@ -1,6 +1,6 @@
 {
   "name": "pi-glean-chat",
-  "version": "1.6.0",
+  "version": "1.7.0",
   "description": "Archived: use Pi's built-in codemode and Glean MCP instead",
   "type": "module",
   "license": "MIT",
